@@ -3,6 +3,7 @@
 
 using System;
 using System.IO;
+using System.Linq;
 using System.Text;
 using System.Xml.Linq;
 using Microsoft.AspNetCore.Testing;
@@ -19,19 +20,13 @@ namespace Microsoft.Extensions.SecretManager.Tools.Tests
         private UserSecretsTestFixture _fixture;
         private ITestOutputHelper _output;
         private TestConsole _console;
-        private StringBuilder _textOutput;
 
         public InitCommandTests(UserSecretsTestFixture fixture, ITestOutputHelper output)
         {
             _fixture = fixture;
             _output = output;
-            _textOutput = new StringBuilder();
 
-            _console = new TestConsole(output)
-            {
-                Error = new StringWriter(_textOutput),
-                Out = new StringWriter(_textOutput),
-            };
+            _console = new TestConsole(output);
         }
 
         private CommandContext MakeCommandContext() => new CommandContext(null, new TestReporter(_output), _console);
@@ -63,7 +58,7 @@ namespace Microsoft.Extensions.SecretManager.Tools.Tests
         }
 
         [Fact]
-        [Flaky("<no longer needed; tracked in Kusto>", FlakyOn.All)]
+        [QuarantinedTest]
         public void AddsEscapedSpecificSecretIdToProject()
         {
             const string SecretId = @"<lots of XML invalid values>&";
@@ -78,6 +73,7 @@ namespace Microsoft.Extensions.SecretManager.Tools.Tests
         }
 
         [Fact]
+        [QuarantinedTest]
         public void DoesNotGenerateIdForProjectWithSecretId()
         {
             const string SecretId = "AlreadyExists";
@@ -101,6 +97,22 @@ namespace Microsoft.Extensions.SecretManager.Tools.Tests
 
             var projectDocument = XDocument.Load(projectFile);
             Assert.Null(projectDocument.Declaration);
+        }
+
+        [Fact]
+        public void DoesNotRemoveBlankLines()
+        {
+            var projectDir = _fixture.CreateProject(null);
+            var projectFile = Path.Combine(projectDir, "TestProject.csproj");
+            var projectDocumentWithoutSecret = XDocument.Load(projectFile, LoadOptions.PreserveWhitespace);
+            var lineCountWithoutSecret = projectDocumentWithoutSecret.ToString().Split(Environment.NewLine).Length;
+
+            new InitCommand(null, null).Execute(MakeCommandContext(), projectDir);
+
+            var projectDocumentWithSecret = XDocument.Load(projectFile, LoadOptions.PreserveWhitespace);
+            var lineCountWithSecret = projectDocumentWithSecret.ToString().Split(Environment.NewLine).Length;
+
+            Assert.True(lineCountWithSecret == lineCountWithoutSecret + 1);
         }
 
         [Fact]

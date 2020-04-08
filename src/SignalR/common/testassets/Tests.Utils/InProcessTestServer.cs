@@ -10,6 +10,7 @@ using System.Threading;
 using System.Threading.Tasks;
 using Microsoft.AspNetCore.Hosting;
 using Microsoft.AspNetCore.Hosting.Server.Features;
+using Microsoft.AspNetCore.Testing;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
@@ -82,6 +83,8 @@ namespace Microsoft.AspNetCore.SignalR.Tests
             _loggerFactory.AddProvider(_logSinkProvider);
             _logger = _loggerFactory.CreateLogger<InProcessTestServer<TStartup>>();
         }
+
+        public IList<LogRecord> GetLogs() => _logSinkProvider.GetLogs();
 
         private async Task StartServerInner()
         {

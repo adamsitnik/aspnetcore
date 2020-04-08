@@ -679,7 +679,6 @@ describe("hubConnection", () => {
             if (transportType !== HttpTransportType.LongPolling) {
                 it("terminates if no messages received within timeout interval", async (done) => {
                     const hubConnection = getConnectionBuilder(transportType).build();
-                    hubConnection.serverTimeoutInMilliseconds = 100;
 
                     hubConnection.onclose((error) => {
                         expect(error).toEqual(new Error("Server timeout elapsed without receiving a message from the server."));
@@ -687,6 +686,12 @@ describe("hubConnection", () => {
                     });
 
                     await hubConnection.start();
+
+                    // set this after start completes to avoid network issues with the handshake taking over 100ms and causing a failure
+                    hubConnection.serverTimeoutInMilliseconds = 1;
+
+                    // invoke a method with a response to reset the timeout using the new value
+                    await hubConnection.invoke("Echo", "");
                 });
             }
 
@@ -1110,6 +1115,34 @@ describe("hubConnection", () => {
                     expect(headerValue).toBeNull();
                 } else {
                     expect(headerValue).toEqual(value);
+                }
+
+                await hubConnection.stop();
+                done();
+            } catch (e) {
+                fail(e);
+            }
+        });
+
+        it("overwrites library headers with user headers", async (done) => {
+            const [name] = getUserAgentHeader();
+            const headers = { [name]: "Custom Agent", "X-HEADER": "VALUE" };
+            const hubConnection = getConnectionBuilder(t, TESTHUBENDPOINT_URL, { headers })
+                .withHubProtocol(new JsonHubProtocol())
+                .build();
+
+            try {
+                await hubConnection.start();
+
+                const customUserHeader = await hubConnection.invoke("GetHeader", "X-HEADER");
+                const headerValue = await hubConnection.invoke("GetHeader", name);
+
+                if ((t === HttpTransportType.ServerSentEvents || t === HttpTransportType.WebSockets) && !Platform.isNode) {
+                    expect(headerValue).toBeNull();
+                    expect(customUserHeader).toBeNull();
+                } else {
+                    expect(headerValue).toEqual("Custom Agent");
+                    expect(customUserHeader).toEqual("VALUE");
                 }
 
                 await hubConnection.stop();

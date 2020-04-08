@@ -105,6 +105,14 @@
     <SkipTests Condition="'$(SkipHelixReadyTests)' == 'true' AND '$(BuildHelixPayload)' == 'true'">true</SkipTests>
   </PropertyGroup>
 
+  <PropertyGroup>
+    <PackageThirdPartyNoticesFile Condition="'$(PackageThirdPartyNoticesFile)' == ''">$(RepoRoot)THIRD-PARTY-NOTICES.TXT</PackageThirdPartyNoticesFile>
+  </PropertyGroup>
+
+  <ItemGroup Condition="'$(IsPackable)' == 'true'">
+    <None Include="$(PackageThirdPartyNoticesFile)" Pack="true" PackagePath="." />
+  </ItemGroup>
+
   <ItemGroup Condition="'$(Language)' == 'C#' AND '$(IsReferenceAssemblyProject)' == 'true'">
     <Compile Include="$(SharedSourceRoot)ReferenceAssemblyInfo.cs" LinkBase="Properties" />
   </ItemGroup>
@@ -132,10 +140,6 @@
       <LatestRuntimeFrameworkVersion>$(SharedFxVersion)</LatestRuntimeFrameworkVersion>
       <DefaultRuntimeFrameworkVersion Condition="'$(IsServicingBuild)' != 'true'">$(SharedFxVersion)</DefaultRuntimeFrameworkVersion>
       <TargetingPackVersion Condition="'$(IsServicingBuild)' != 'true'">$(SharedFxVersion)</TargetingPackVersion>
-    </KnownFrameworkReference>
-
-    <KnownFrameworkReference Update="NETStandard.Library">
-      <TargetingPackVersion Condition="'%(TargetFramework)' == 'netstandard2.1' and '$(IsServicingBuild)' != 'true'">$(NETStandardLibraryRefPackageVersion)</TargetingPackVersion>
     </KnownFrameworkReference>
 
     <!-- Track compiler separately from Arcade.-->
@@ -167,5 +171,7 @@
   <Import Project="eng\targets\Npm.Common.targets"  Condition="'$(MSBuildProjectExtension)' == '.npmproj'" />
   <Import Project="eng\targets\ReferenceAssembly.targets" Condition=" $(HasReferenceAssembly) " />
   <Import Project="eng\targets\Helix.targets" Condition="'$(IsTestProject)' == 'true'" />
+  <Import Project="eng\targets\FunctionalTestAsset.targets" Condition="'$(IsTestAssetProject)' == 'true'" />
+  <Import Project="eng\targets\FunctionalTestWithAssets.targets" Condition="'$(ContainsFunctionalTestAssets)' == 'true'" />
 
 </Project>

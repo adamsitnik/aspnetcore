@@ -62,10 +62,11 @@ namespace Microsoft.AspNetCore.Server.Kestrel
 }
 namespace Microsoft.AspNetCore.Server.Kestrel.Core
 {
-    public sealed partial class BadHttpRequestException : System.IO.IOException
+    [System.ObsoleteAttribute("Moved to Microsoft.AspNetCore.Http.BadHttpRequestException")]
+    public sealed partial class BadHttpRequestException : Microsoft.AspNetCore.Http.BadHttpRequestException
     {
-        internal BadHttpRequestException() { }
-        public int StatusCode { [System.Runtime.CompilerServices.CompilerGeneratedAttribute] get { throw null; } }
+        internal BadHttpRequestException() : base (default(string), default(int)) { }
+        public new int StatusCode { get { throw null; } }
     }
     public partial class Http2Limits
     {
@@ -96,6 +97,7 @@ namespace Microsoft.AspNetCore.Server.Kestrel.Core
     public partial class KestrelServer : Microsoft.AspNetCore.Hosting.Server.IServer, System.IDisposable
     {
         public KestrelServer(Microsoft.Extensions.Options.IOptions<Microsoft.AspNetCore.Server.Kestrel.Core.KestrelServerOptions> options, System.Collections.Generic.IEnumerable<Microsoft.AspNetCore.Connections.IConnectionListenerFactory> transportFactories, Microsoft.Extensions.Logging.ILoggerFactory loggerFactory) { }
+        public KestrelServer(Microsoft.Extensions.Options.IOptions<Microsoft.AspNetCore.Server.Kestrel.Core.KestrelServerOptions> options, System.Collections.Generic.IEnumerable<Microsoft.AspNetCore.Connections.IConnectionListenerFactory> transportFactories, System.Collections.Generic.IEnumerable<Microsoft.AspNetCore.Connections.IMultiplexedConnectionListenerFactory> multiplexedFactories, Microsoft.Extensions.Logging.ILoggerFactory loggerFactory) { }
         public Microsoft.AspNetCore.Http.Features.IFeatureCollection Features { [System.Runtime.CompilerServices.CompilerGeneratedAttribute] get { throw null; } }
         public Microsoft.AspNetCore.Server.Kestrel.Core.KestrelServerOptions Options { get { throw null; } }
         public void Dispose() { }
@@ -126,6 +128,7 @@ namespace Microsoft.AspNetCore.Server.Kestrel.Core
     {
         public KestrelServerOptions() { }
         public bool AddServerHeader { [System.Runtime.CompilerServices.CompilerGeneratedAttribute] get { throw null; } [System.Runtime.CompilerServices.CompilerGeneratedAttribute] set { } }
+        public bool AllowResponseHeaderCompression { [System.Runtime.CompilerServices.CompilerGeneratedAttribute] get { throw null; } [System.Runtime.CompilerServices.CompilerGeneratedAttribute] set { } }
         public bool AllowSynchronousIO { [System.Runtime.CompilerServices.CompilerGeneratedAttribute] get { throw null; } [System.Runtime.CompilerServices.CompilerGeneratedAttribute] set { } }
         public System.IServiceProvider ApplicationServices { [System.Runtime.CompilerServices.CompilerGeneratedAttribute] get { throw null; } [System.Runtime.CompilerServices.CompilerGeneratedAttribute] set { } }
         public Microsoft.AspNetCore.Server.Kestrel.KestrelConfigurationLoader ConfigurationLoader { [System.Runtime.CompilerServices.CompilerGeneratedAttribute] get { throw null; } [System.Runtime.CompilerServices.CompilerGeneratedAttribute] set { } }
@@ -149,7 +152,7 @@ namespace Microsoft.AspNetCore.Server.Kestrel.Core
         public void ListenUnixSocket(string socketPath) { }
         public void ListenUnixSocket(string socketPath, System.Action<Microsoft.AspNetCore.Server.Kestrel.Core.ListenOptions> configure) { }
     }
-    public partial class ListenOptions : Microsoft.AspNetCore.Connections.IConnectionBuilder
+    public partial class ListenOptions : Microsoft.AspNetCore.Connections.IConnectionBuilder, Microsoft.AspNetCore.Connections.IMultiplexedConnectionBuilder
     {
         internal ListenOptions() { }
         public System.IServiceProvider ApplicationServices { get { throw null; } }
@@ -159,6 +162,8 @@ namespace Microsoft.AspNetCore.Server.Kestrel.Core
         public Microsoft.AspNetCore.Server.Kestrel.Core.HttpProtocols Protocols { [System.Runtime.CompilerServices.CompilerGeneratedAttribute] get { throw null; } [System.Runtime.CompilerServices.CompilerGeneratedAttribute] set { } }
         public string SocketPath { get { throw null; } }
         public Microsoft.AspNetCore.Connections.ConnectionDelegate Build() { throw null; }
+        Microsoft.AspNetCore.Connections.MultiplexedConnectionDelegate Microsoft.AspNetCore.Connections.IMultiplexedConnectionBuilder.Build() { throw null; }
+        Microsoft.AspNetCore.Connections.IMultiplexedConnectionBuilder Microsoft.AspNetCore.Connections.IMultiplexedConnectionBuilder.Use(System.Func<Microsoft.AspNetCore.Connections.MultiplexedConnectionDelegate, Microsoft.AspNetCore.Connections.MultiplexedConnectionDelegate> middleware) { throw null; }
         public override string ToString() { throw null; }
         public Microsoft.AspNetCore.Connections.IConnectionBuilder Use(System.Func<Microsoft.AspNetCore.Connections.ConnectionDelegate, Microsoft.AspNetCore.Connections.ConnectionDelegate> middleware) { throw null; }
     }

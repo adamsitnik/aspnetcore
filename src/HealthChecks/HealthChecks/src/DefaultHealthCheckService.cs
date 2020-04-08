@@ -125,7 +125,8 @@ namespace Microsoft.Extensions.Diagnostics.HealthChecks
                         description: "A timeout occurred while running check.",
                         duration: duration,
                         exception: ex,
-                        data: null);
+                        data: null,
+                        tags: registration.Tags);
 
                     Log.HealthCheckError(_logger, registration, ex, duration);
                 }
@@ -139,7 +140,8 @@ namespace Microsoft.Extensions.Diagnostics.HealthChecks
                         description: ex.Message,
                         duration: duration,
                         exception: ex,
-                        data: null);
+                        data: null,
+                        tags: registration.Tags);
 
                     Log.HealthCheckError(_logger, registration, ex, duration);
                 }
@@ -197,7 +199,7 @@ namespace Microsoft.Extensions.Diagnostics.HealthChecks
                 "Running health check {HealthCheckName}");
 
             // These are separate so they can have different log levels
-            private static readonly string HealthCheckEndText = "Health check {HealthCheckName} completed after {ElapsedMilliseconds}ms with status {HealthStatus} and '{HealthCheckDescription}'";
+            private static readonly string HealthCheckEndText = "Health check {HealthCheckName} completed after {ElapsedMilliseconds}ms with status {HealthStatus} and description '{HealthCheckDescription}'";
 
             private static readonly Action<ILogger, string, double, HealthStatus, string, Exception> _healthCheckEndHealthy = LoggerMessage.Define<string, double, HealthStatus, string>(
                 LogLevel.Debug,

@@ -520,7 +520,6 @@ namespace Microsoft.AspNetCore.SignalR.Client.FunctionalTests
         [Theory]
         [MemberData(nameof(HubProtocolsAndTransportsAndHubPaths))]
         [LogLevel(LogLevel.Trace)]
-        [Flaky("<No longer used; tracked in Kusto>", FlakyOn.All)]
         public async Task StreamAsyncTest(string protocolName, HttpTransportType transportType, string path)
         {
             var protocol = HubProtocols[protocolName];
@@ -1333,6 +1332,102 @@ namespace Microsoft.AspNetCore.SignalR.Client.FunctionalTests
                 {
                     await connection.DisposeAsync().OrTimeout();
                 }
+            }
+        }
+
+        [Theory]
+        [QuarantinedTest]
+        [MemberData(nameof(HubProtocolsList))]
+        public async Task ServerLogsErrorIfClientInvokeCannotBeSerialized(string protocolName)
+        {
+            // Just to help sanity check that the right exception is thrown
+            var exceptionSubstring = protocolName switch
+            {
+                "json" => "A possible object cycle was detected.",
+                "newtonsoft-json" => "A possible object cycle was detected.",
+                "messagepack" => "Failed to serialize Microsoft.AspNetCore.SignalR.Client.FunctionalTests.TestHub+Unserializable value.",
+                var x => throw new Exception($"The test does not have an exception string for the protocol '{x}'!"),
+            };
+
+            var protocol = HubProtocols[protocolName];
+            using (var server = await StartServer<Startup>(write => write.EventId.Name == "FailedWritingMessage"))
+            {
+                var connection = CreateHubConnection(server.Url, "/default", HttpTransportType.WebSockets, protocol, LoggerFactory);
+                var closedTcs = new TaskCompletionSource<Exception>(TaskCreationOptions.RunContinuationsAsynchronously);
+                connection.Closed += (ex) => { closedTcs.TrySetResult(ex); return Task.CompletedTask; };
+                try
+                {
+                    await connection.StartAsync().OrTimeout();
+
+                    var result = connection.InvokeAsync<string>(nameof(TestHub.CallWithUnserializableObject));
+
+                    // The connection should close.
+                    Assert.Null(await closedTcs.Task.OrTimeout());
+
+                    await Assert.ThrowsAsync<TaskCanceledException>(() => result).OrTimeout();
+                }
+                catch (Exception ex)
+                {
+                    LoggerFactory.CreateLogger<HubConnectionTests>().LogError(ex, "{ExceptionType} from test", ex.GetType().FullName);
+                    throw;
+                }
+                finally
+                {
+                    await connection.DisposeAsync().OrTimeout();
+                }
+
+                var errorLog = server.GetLogs().SingleOrDefault(r => r.Write.EventId.Name == "FailedWritingMessage");
+                Assert.NotNull(errorLog);
+                Assert.Contains(exceptionSubstring, errorLog.Write.Exception.Message);
+                Assert.Equal(LogLevel.Error, errorLog.Write.LogLevel);
+            }
+        }
+
+        [Theory]
+        [QuarantinedTest]
+        [MemberData(nameof(HubProtocolsList))]
+        public async Task ServerLogsErrorIfReturnValueCannotBeSerialized(string protocolName)
+        {
+            // Just to help sanity check that the right exception is thrown
+            var exceptionSubstring = protocolName switch
+            {
+                "json" => "A possible object cycle was detected.",
+                "newtonsoft-json" => "A possible object cycle was detected.",
+                "messagepack" => "Failed to serialize Microsoft.AspNetCore.SignalR.Client.FunctionalTests.TestHub+Unserializable value.",
+                var x => throw new Exception($"The test does not have an exception string for the protocol '{x}'!"),
+            };
+
+            var protocol = HubProtocols[protocolName];
+            using (var server = await StartServer<Startup>(write => write.EventId.Name == "FailedWritingMessage"))
+            {
+                var connection = CreateHubConnection(server.Url, "/default", HttpTransportType.LongPolling, protocol, LoggerFactory);
+                var closedTcs = new TaskCompletionSource<Exception>(TaskCreationOptions.RunContinuationsAsynchronously);
+                connection.Closed += (ex) => { closedTcs.TrySetResult(ex); return Task.CompletedTask; };
+                try
+                {
+                    await connection.StartAsync().OrTimeout();
+
+                    var result = connection.InvokeAsync<string>(nameof(TestHub.GetUnserializableObject)).OrTimeout();
+
+                    // The connection should close.
+                    Assert.Null(await closedTcs.Task.OrTimeout());
+
+                    await Assert.ThrowsAsync<TaskCanceledException>(() => result).OrTimeout();
+                }
+                catch (Exception ex)
+                {
+                    LoggerFactory.CreateLogger<HubConnectionTests>().LogError(ex, "{ExceptionType} from test", ex.GetType().FullName);
+                    throw;
+                }
+                finally
+                {
+                    await connection.DisposeAsync().OrTimeout();
+                }
+
+                var errorLog = server.GetLogs().SingleOrDefault(r => r.Write.EventId.Name == "FailedWritingMessage");
+                Assert.NotNull(errorLog);
+                Assert.Contains(exceptionSubstring, errorLog.Write.Exception.Message);
+                Assert.Equal(LogLevel.Error, errorLog.Write.LogLevel);
             }
         }
 
