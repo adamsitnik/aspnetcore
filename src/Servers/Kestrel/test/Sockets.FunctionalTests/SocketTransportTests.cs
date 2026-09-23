@@ -3,24 +3,960 @@
 
 using System.Buffers;
 using System.Diagnostics;
+using System.IO.Pipelines;
 using System.Net;
 using System.Net.Http;
 using System.Net.Sockets;
+using System.Runtime.CompilerServices;
+using System.Threading;
+using System.Threading.Channels;
 using System.Threading.Tasks;
 using Microsoft.AspNetCore.Builder;
+using Microsoft.AspNetCore.Connections;
 using Microsoft.AspNetCore.Connections.Features;
 using Microsoft.AspNetCore.Hosting;
 using Microsoft.AspNetCore.Server.Kestrel.FunctionalTests;
+using Microsoft.AspNetCore.Server.Kestrel.Transport.Sockets;
+using Microsoft.AspNetCore.Server.Kestrel.Transport.Sockets.Internal;
 using Microsoft.AspNetCore.InternalTesting;
 using Microsoft.Extensions.Hosting;
+using Microsoft.Extensions.Logging.Abstractions;
 using Xunit;
 using KestrelHttpMethod = Microsoft.AspNetCore.Server.Kestrel.Core.Internal.Http.HttpMethod;
 using KestrelHttpVersion = Microsoft.AspNetCore.Server.Kestrel.Core.Internal.Http.HttpVersion;
 
 namespace Microsoft.AspNetCore.Server.Kestrel.Sockets.FunctionalTests;
 
+#nullable enable
+
 public class SocketTransportTests : LoggedTestBase
 {
+    [Fact]
+    public async Task MultishotReaderPreservesOrderAndPartialConsumption()
+    {
+        ReceiveSource source = new ReceiveSource();
+        IoUringPipeReader reader = new IoUringPipeReader(source.ReadAsync, PipeOptions.Default);
+        reader.Start();
+        try
+        {
+            TestOwner first = new TestOwner([1, 2, 3]);
+            source.Write(first);
+            ReadResult result = await reader.ReadAsync().AsTask().DefaultTimeout();
+            Assert.True(result.Buffer.First.Equals(first.Memory));
+            Assert.False(first.Disposed);
+            reader.AdvanceTo(result.Buffer.GetPosition(1));
+            Assert.False(first.Disposed);
+
+            result = await reader.ReadAsync().AsTask().DefaultTimeout();
+            Assert.Equal(new byte[] { 2, 3 }, result.Buffer.ToArray());
+            reader.AdvanceTo(result.Buffer.Start, result.Buffer.End);
+            Assert.True(first.Disposed);
+
+            source.Write(new TestOwner([4, 5]));
+            result = await reader.ReadAsync().AsTask().DefaultTimeout();
+            Assert.Equal(new byte[] { 2, 3, 4, 5 }, result.Buffer.ToArray());
+            reader.AdvanceTo(result.Buffer.End);
+            source.Complete();
+            result = await reader.ReadAsync().AsTask().DefaultTimeout();
+            Assert.True(result.IsCompleted);
+            Assert.True(result.Buffer.IsEmpty);
+            reader.AdvanceTo(result.Buffer.End);
+        }
+        finally
+        {
+            await reader.CompleteAsync().AsTask().DefaultTimeout();
+        }
+    }
+
+    [Fact]
+    public async Task MultishotReaderReturnsExaminedLeasesBeyondNativePoolCapacity()
+    {
+        const int BufferCount = 1100;
+        const int BufferSize = 4096;
+        TestOwner? previous = null;
+        int returned = 0;
+        async IAsyncEnumerable<IMemoryOwner<byte>> Receive([EnumeratorCancellation] CancellationToken cancellationToken)
+        {
+            for (int index = 0; index < BufferCount; index++)
+            {
+                if (previous is not null)
+                {
+                    Assert.True(previous.Disposed);
+                    returned++;
+                }
+
+                byte[] bytes = new byte[BufferSize];
+                Array.Fill(bytes, (byte)(index % 251));
+                previous = new TestOwner(bytes);
+                yield return previous;
+                await Task.Yield();
+                cancellationToken.ThrowIfCancellationRequested();
+            }
+        }
+
+        IoUringPipeReader reader = new IoUringPipeReader(Receive,
+            new PipeOptions(pauseWriterThreshold: BufferSize, resumeWriterThreshold: BufferSize / 2));
+        reader.Start();
+        try
+        {
+            for (int index = 0; index < BufferCount; index++)
+            {
+                ReadResult result = await reader.ReadAsync().AsTask().DefaultTimeout();
+                Assert.Equal((long)(index + 1) * BufferSize, result.Buffer.Length);
+                Assert.Equal((byte)0, result.Buffer.FirstSpan[0]);
+                Assert.Equal((byte)(index % 251), result.Buffer.Slice((long)index * BufferSize).FirstSpan[0]);
+                TestOwner current = previous!;
+                Assert.False(current.Disposed);
+                reader.AdvanceTo(result.Buffer.Start, result.Buffer.End);
+                Assert.True(current.Disposed);
+            }
+
+            ReadResult completed = await reader.ReadAsync().AsTask().DefaultTimeout();
+            Assert.True(completed.IsCompleted);
+            reader.AdvanceTo(completed.Buffer.End);
+            Assert.Equal(BufferCount - 1, returned);
+        }
+        finally
+        {
+            await reader.CompleteAsync().AsTask().DefaultTimeout();
+        }
+    }
+
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public async Task MultishotReaderCancellationDoesNotCancelReceive(bool useToken)
+    {
+        ReceiveSource source = new ReceiveSource();
+        IoUringPipeReader reader = new IoUringPipeReader(source.ReadAsync, PipeOptions.Default);
+        reader.Start();
+        using CancellationTokenSource cancellation = new CancellationTokenSource();
+        try
+        {
+            Task<ReadResult> pending = reader.ReadAsync(useToken ? cancellation.Token : default).AsTask();
+            if (useToken)
+            {
+                cancellation.Cancel();
+                OperationCanceledException error = await Assert.ThrowsAnyAsync<OperationCanceledException>(
+                    () => pending.DefaultTimeout());
+                Assert.Equal(cancellation.Token, error.CancellationToken);
+            }
+            else
+            {
+                reader.CancelPendingRead();
+                ReadResult canceled = await pending.DefaultTimeout();
+                Assert.True(canceled.IsCanceled);
+                reader.AdvanceTo(canceled.Buffer.End);
+            }
+
+            Assert.False(source.Stopped.Task.IsCompleted);
+            source.Write(new TestOwner([42]));
+            ReadResult result = await reader.ReadAsync().AsTask().DefaultTimeout();
+            Assert.Equal(new byte[] { 42 }, result.Buffer.ToArray());
+            reader.AdvanceTo(result.Buffer.End);
+        }
+        finally
+        {
+            await reader.CompleteAsync().AsTask().DefaultTimeout();
+        }
+    }
+
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public async Task MultishotReaderCompletesPendingReadOnErrorOrEof(bool error)
+    {
+        ReceiveSource source = new ReceiveSource();
+        IoUringPipeReader reader = new IoUringPipeReader(source.ReadAsync, PipeOptions.Default);
+        reader.Start();
+        Task<ReadResult> pending = reader.ReadAsync().AsTask();
+        SocketException reset = new SocketException((int)SocketError.ConnectionReset);
+        source.Complete(error ? reset : null);
+        try
+        {
+            if (error)
+            {
+                Assert.Same(reset, await Assert.ThrowsAsync<SocketException>(() => pending.DefaultTimeout()));
+            }
+            else
+            {
+                ReadResult result = await pending.DefaultTimeout();
+                Assert.True(result.IsCompleted);
+                reader.AdvanceTo(result.Buffer.End);
+            }
+
+            await reader.Closed.DefaultTimeout();
+        }
+        finally
+        {
+            await reader.CompleteAsync().AsTask().DefaultTimeout();
+        }
+    }
+
+    [Theory]
+    [InlineData(true, true)]
+    [InlineData(true, false)]
+    [InlineData(false, true)]
+    [InlineData(false, false)]
+    public async Task MultishotReaderCleanupCancelsPendingOrPausedReceive(bool paused, bool abort)
+    {
+        ReceiveSource source = new ReceiveSource();
+        IoUringPipeReader reader = new IoUringPipeReader(source.ReadAsync,
+            new PipeOptions(pauseWriterThreshold: 4, resumeWriterThreshold: 2));
+        reader.Start();
+        TestOwner owner = new TestOwner([1, 2, 3, 4]);
+        Task<ReadResult> pending = reader.ReadAsync().AsTask();
+        if (paused)
+        {
+            source.Write(owner);
+            ReadResult result = await pending.DefaultTimeout();
+            Assert.False(owner.Disposed);
+            reader.AdvanceTo(result.Buffer.Start, result.Buffer.Start);
+        }
+
+        IOException failure = new IOException("Stopped");
+        if (abort)
+        {
+            reader.Abort(failure);
+        }
+        else
+        {
+            reader.Complete();
+        }
+
+        if (!paused)
+        {
+            if (abort)
+            {
+                Assert.Same(failure, await Assert.ThrowsAsync<IOException>(() => pending.DefaultTimeout()));
+            }
+            else
+            {
+                await Assert.ThrowsAsync<InvalidOperationException>(() => pending.DefaultTimeout());
+            }
+        }
+
+        await reader.Closed.DefaultTimeout();
+        await source.Stopped.Task.DefaultTimeout();
+        await reader.CompleteAsync().AsTask().DefaultTimeout();
+        await reader.CompleteAsync().AsTask().DefaultTimeout();
+        if (paused)
+        {
+            Assert.True(owner.Disposed);
+        }
+    }
+
+    [Fact]
+    public async Task MultishotReaderBackpressureUsesExaminedBytes()
+    {
+        ReceiveSource source = new ReceiveSource();
+        TaskCompletionSource paused = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        IoUringPipeReader reader = new IoUringPipeReader(source.ReadAsync,
+            new PipeOptions(pauseWriterThreshold: 4, resumeWriterThreshold: 2),
+            onPause: value => { if (value) { paused.TrySetResult(); } });
+        reader.Start();
+        try
+        {
+            source.Write(new TestOwner([1, 2, 3, 4]));
+            source.Write(new TestOwner([5]));
+            await paused.Task.DefaultTimeout();
+            ReadResult result = await reader.ReadAsync().AsTask().DefaultTimeout();
+            Assert.Equal(4, result.Buffer.Length);
+            reader.AdvanceTo(result.Buffer.Start, result.Buffer.Start);
+            Assert.Equal(1, source.Yielded);
+
+            result = await reader.ReadAsync().AsTask().DefaultTimeout();
+            reader.AdvanceTo(result.Buffer.Start, result.Buffer.End);
+            result = await reader.ReadAsync().AsTask().DefaultTimeout();
+            Assert.Equal(new byte[] { 1, 2, 3, 4, 5 }, result.Buffer.ToArray());
+            reader.AdvanceTo(result.Buffer.End);
+        }
+        finally
+        {
+            await reader.CompleteAsync().AsTask().DefaultTimeout();
+        }
+    }
+
+    [Fact]
+    public async Task MultishotReaderStartFailureAndCompleteBeforeStartDoNotHang()
+    {
+        IOException failure = new IOException("Start failed");
+        IoUringPipeReader reader = new IoUringPipeReader(_ => throw failure, PipeOptions.Default);
+        Task<ReadResult> pending = reader.ReadAsync().AsTask();
+        reader.Start();
+        Assert.Same(failure, await Assert.ThrowsAsync<IOException>(() => pending.DefaultTimeout()));
+        await reader.CompleteAsync().AsTask().DefaultTimeout();
+
+        reader = new IoUringPipeReader(_ => throw failure, PipeOptions.Default);
+        reader.Complete();
+        reader.Start();
+        await reader.Closed.DefaultTimeout();
+    }
+
+    [Theory]
+    [InlineData(false, false)]
+    [InlineData(true, false)]
+    [InlineData(true, true)]
+    public async Task MultishotReaderLoopbackReceivesAndDrains(bool retainExamined, bool asyncSend)
+    {
+        using Socket listener = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
+        listener.Bind(new IPEndPoint(IPAddress.Loopback, 0));
+        listener.Listen(1);
+        using Socket client = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
+        Task connecting = client.ConnectAsync(listener.LocalEndPoint!);
+        using Socket server = await listener.AcceptAsync().DefaultTimeout();
+        await connecting.DefaultTimeout();
+        IoUringPipeReader reader = new IoUringPipeReader(server, PipeOptions.Default);
+        reader.Start();
+        try
+        {
+            byte[] payload = new byte[retainExamined ? 1025 * 4096 + 17 : 8193];
+            for (int index = 0; index < payload.Length; index++)
+            {
+                payload[index] = (byte)(index % 251);
+            }
+
+            Task sending = Task.Run(async () =>
+            {
+                int sent = 0;
+                while (sent != payload.Length)
+                {
+                    sent += asyncSend
+                        ? await client.SendAsync(payload.AsMemory(sent), SocketFlags.None)
+                        : client.Send(payload.AsSpan(sent), SocketFlags.None);
+                }
+
+                client.Shutdown(SocketShutdown.Send);
+            });
+
+            int received = 0;
+            while (true)
+            {
+                ReadResult result = await reader.ReadAsync().AsTask().DefaultTimeout();
+                Assert.True(!retainExamined || result.Buffer.Length >= received,
+                    $"Retained buffer shrank: length={result.Buffer.Length}, received={received}, completed={result.IsCompleted}");
+                byte[] bytes = (retainExamined ? result.Buffer.Slice(received) : result.Buffer).ToArray();
+                Assert.True(received + bytes.Length <= payload.Length,
+                    $"Received too many bytes: previous={received}, additional={bytes.Length}, expected={payload.Length}");
+                Assert.Equal(payload.AsSpan(received, bytes.Length).ToArray(), bytes);
+                received += bytes.Length;
+                reader.AdvanceTo(retainExamined && !result.IsCompleted ? result.Buffer.Start : result.Buffer.End, result.Buffer.End);
+                if (result.IsCompleted)
+                {
+                    break;
+                }
+            }
+
+            Assert.Equal(payload.Length, received);
+            await sending.DefaultTimeout();
+        }
+        finally
+        {
+            await reader.CompleteAsync().AsTask().DefaultTimeout();
+        }
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task MultishotConnectionClosesAndDisposesWithPendingOrPausedInput(bool paused)
+    {
+        using Socket listener = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
+        listener.Bind(new IPEndPoint(IPAddress.Loopback, 0));
+        listener.Listen(1);
+        using Socket client = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
+        Task connecting = client.ConnectAsync(listener.LocalEndPoint!);
+        Socket server = await listener.AcceptAsync().DefaultTimeout();
+        await connecting.DefaultTimeout();
+        using SocketConnectionContextFactory factory = new SocketConnectionContextFactory(
+            new SocketConnectionFactoryOptions { MaxReadBufferSize = 4 }, NullLogger.Instance);
+        ConnectionContext connection = factory.Create(server);
+        TestOutputHelper.WriteLine($"Connection implementation: {connection.GetType().Name}");
+        Assert.Equal(IoUringConnection.IsSupported, connection is IoUringConnection);
+        Assert.Same(server, connection.Features.Get<IConnectionSocketFeature>()!.Socket);
+        CancellationToken closed = connection.ConnectionClosed;
+        try
+        {
+            if (paused)
+            {
+                await client.SendAsync(new byte[] { 1, 2, 3, 4 }, SocketFlags.None);
+                ReadResult result = await connection.Transport.Input.ReadAsync().AsTask().DefaultTimeout();
+                connection.Transport.Input.AdvanceTo(result.Buffer.Start, result.Buffer.Start);
+            }
+
+            ConnectionAbortedException failure = new ConnectionAbortedException("Test abort");
+            connection.Abort(failure);
+            await connection.DisposeAsync().AsTask().DefaultTimeout();
+            Assert.True(closed.IsCancellationRequested);
+            Assert.True(server.SafeHandle.IsClosed);
+            await connection.DisposeAsync().AsTask().DefaultTimeout();
+        }
+        finally
+        {
+            await connection.DisposeAsync().AsTask().DefaultTimeout();
+        }
+    }
+
+    [Fact]
+    public async Task MultishotTransportAsyncSenderPreservesLargePayload()
+    {
+        using Socket listener = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
+        listener.Bind(new IPEndPoint(IPAddress.Loopback, 0));
+        listener.Listen(1);
+        using Socket client = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
+        Task connecting = client.ConnectAsync(listener.LocalEndPoint!);
+        using Socket server = await listener.AcceptAsync().DefaultTimeout();
+        await connecting.DefaultTimeout();
+        byte[] payload = new byte[1025 * 4096 + 17];
+        for (int index = 0; index < payload.Length; index++)
+        {
+            payload[index] = (byte)(index % 251);
+        }
+
+        Task receiving = Task.Run(() =>
+        {
+            byte[] buffer = new byte[65536];
+            int received = 0;
+            int count;
+            while ((count = server.Receive(buffer)) != 0)
+            {
+                Assert.True(received + count <= payload.Length,
+                    $"Ordinary receive got too many bytes: previous={received}, additional={count}, expected={payload.Length}");
+                Assert.Equal(payload.AsSpan(received, count).ToArray(), buffer.AsSpan(0, count).ToArray());
+                received += count;
+            }
+
+            Assert.Equal(payload.Length, received);
+        });
+        try
+        {
+            int sent = 0;
+            while (sent != payload.Length)
+            {
+                sent += await client.SendAsync(payload.AsMemory(sent), SocketFlags.None);
+            }
+
+            client.Shutdown(SocketShutdown.Send);
+            await receiving.DefaultTimeout();
+        }
+        finally
+        {
+            server.Dispose();
+        }
+    }
+
+    [Fact]
+    public async Task MultishotConnectionMapsPeerResetToPendingRead()
+    {
+        using Socket listener = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
+        listener.Bind(new IPEndPoint(IPAddress.Loopback, 0));
+        listener.Listen(1);
+        using Socket client = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
+        Task connecting = client.ConnectAsync(listener.LocalEndPoint!);
+        Socket server = await listener.AcceptAsync().DefaultTimeout();
+        await connecting.DefaultTimeout();
+        using SocketConnectionContextFactory factory = new SocketConnectionContextFactory(
+            new SocketConnectionFactoryOptions(), NullLogger.Instance);
+        await using ConnectionContext connection = factory.Create(server);
+        Task<ReadResult> pending = connection.Transport.Input.ReadAsync().AsTask();
+        client.Close(0);
+        await Assert.ThrowsAsync<ConnectionResetException>(() => pending.DefaultTimeout());
+    }
+
+    [Fact]
+    public async Task MultishotAcceptCancellationDoesNotStopListener()
+    {
+        using Socket listener = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
+        listener.Bind(new IPEndPoint(IPAddress.Loopback, 0));
+        listener.Listen(4);
+        IoUringAcceptQueue queue = new IoUringAcceptQueue(listener, new SocketTransportOptions());
+        queue.Start();
+        try
+        {
+            using CancellationTokenSource cancellation = new CancellationTokenSource();
+            Task<Socket?> canceled = queue.AcceptAsync(cancellation.Token).AsTask();
+            cancellation.Cancel();
+            OperationCanceledException error = await Assert.ThrowsAnyAsync<OperationCanceledException>(() => canceled.DefaultTimeout());
+            Assert.Equal(cancellation.Token, error.CancellationToken);
+
+            using Socket client = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
+            await client.ConnectAsync(listener.LocalEndPoint!).DefaultTimeout();
+            using Socket? accepted = await queue.AcceptAsync().AsTask().DefaultTimeout();
+            Assert.NotNull(accepted);
+            Assert.True(accepted.NoDelay);
+            Task<Socket?> pending = queue.AcceptAsync().AsTask();
+            queue.Stop();
+            Assert.Null(await pending.DefaultTimeout());
+        }
+        finally
+        {
+            queue.Stop();
+            await queue.Closed.DefaultTimeout();
+        }
+    }
+
+    [Fact]
+    public async Task MultishotReaderRejectsOverlappingReadsAndInvalidAdvances()
+    {
+        ReceiveSource source = new ReceiveSource();
+        IoUringPipeReader reader = new IoUringPipeReader(source.ReadAsync, PipeOptions.Default);
+        reader.Start();
+        try
+        {
+            Task<ReadResult> pending = reader.ReadAsync().AsTask();
+            Assert.Throws<InvalidOperationException>(() => reader.ReadAsync());
+            source.Write(new TestOwner([1, 2, 3]));
+            ReadResult result = await pending.DefaultTimeout();
+            Assert.Throws<InvalidOperationException>(() => reader.TryRead(out _));
+            Assert.Throws<InvalidOperationException>(() => reader.AdvanceTo(result.Buffer.End, result.Buffer.Start));
+            reader.AdvanceTo(result.Buffer.Start, result.Buffer.GetPosition(1));
+            result = await reader.ReadAsync().AsTask().DefaultTimeout();
+            reader.AdvanceTo(result.Buffer.Start, result.Buffer.Start);
+            result = await reader.ReadAsync().AsTask().DefaultTimeout();
+            Assert.Equal(new byte[] { 1, 2, 3 }, result.Buffer.ToArray());
+            reader.AdvanceTo(result.Buffer.End);
+
+            reader.CancelPendingRead();
+            result = await reader.ReadAsync().AsTask().DefaultTimeout();
+            Assert.True(result.IsCanceled);
+            reader.AdvanceTo(result.Buffer.End);
+
+            using CancellationTokenSource cancellation = new CancellationTokenSource();
+            cancellation.Cancel();
+            OperationCanceledException error = await Assert.ThrowsAnyAsync<OperationCanceledException>(
+                () => reader.ReadAsync(cancellation.Token).AsTask());
+            Assert.Equal(cancellation.Token, error.CancellationToken);
+        }
+        finally
+        {
+            await reader.CompleteAsync().AsTask().DefaultTimeout();
+        }
+    }
+
+    [Fact]
+    public async Task MultishotReaderHonorsInputPoolAndScheduler()
+    {
+        ReceiveSource source = new ReceiveSource();
+        using CountingPool pool = new CountingPool();
+        CountingScheduler scheduler = new CountingScheduler();
+        IoUringPipeReader reader = new IoUringPipeReader(source.ReadAsync,
+            new PipeOptions(pool, scheduler, useSynchronizationContext: false));
+        reader.Start();
+        try
+        {
+            Task<ReadResult> pending = reader.ReadAsync().AsTask();
+            TestOwner owner = new TestOwner([1, 2, 3]);
+            source.Write(owner);
+            ReadResult result = await pending.DefaultTimeout();
+            Assert.Equal(1, scheduler.Scheduled);
+            Assert.Equal(0, pool.Rented);
+            Assert.False(owner.Disposed);
+            reader.AdvanceTo(result.Buffer.Start, result.Buffer.End);
+            Assert.Equal(1, pool.Rented);
+            Assert.True(owner.Disposed);
+            source.Complete();
+            result = await reader.ReadAsync().AsTask().DefaultTimeout();
+            Assert.Equal(new byte[] { 1, 2, 3 }, result.Buffer.ToArray());
+            reader.AdvanceTo(result.Buffer.End);
+        }
+        finally
+        {
+            await reader.CompleteAsync().AsTask().DefaultTimeout();
+        }
+    }
+
+    [Fact]
+    public async Task MultishotReaderAbortDoesNotInvalidateActiveRead()
+    {
+        ReceiveSource source = new ReceiveSource();
+        IoUringPipeReader reader = new IoUringPipeReader(source.ReadAsync, PipeOptions.Default);
+        reader.Start();
+        TestOwner owner = new TestOwner([1, 2, 3]);
+        source.Write(owner);
+        ReadResult result = await reader.ReadAsync().AsTask().DefaultTimeout();
+        reader.Abort(new IOException("Aborted"));
+        await reader.Closed.DefaultTimeout();
+        Assert.False(owner.Disposed);
+        Assert.Equal(new byte[] { 1, 2, 3 }, result.Buffer.ToArray());
+        reader.AdvanceTo(result.Buffer.End);
+        Assert.True(owner.Disposed);
+        await reader.CompleteAsync().AsTask().DefaultTimeout();
+    }
+
+    [Fact]
+    public async Task MultishotAcceptStopDisposesUnclaimedSockets()
+    {
+        using Socket listener = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
+        listener.Bind(new IPEndPoint(IPAddress.Loopback, 0));
+        listener.Listen(4);
+        IoUringAcceptQueue queue = new IoUringAcceptQueue(listener, new SocketTransportOptions());
+        queue.Start();
+        Socket[] clients = new Socket[4];
+        try
+        {
+            for (int index = 0; index < clients.Length; index++)
+            {
+                clients[index] = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
+                await clients[index].ConnectAsync(listener.LocalEndPoint!).DefaultTimeout();
+            }
+
+            // Claim one socket so the accept pump has definitely started, but leave the
+            // remaining sockets for listener/enumerator disposal rather than the application.
+            using Socket? accepted = await queue.AcceptAsync().AsTask().DefaultTimeout();
+            Assert.NotNull(accepted);
+            accepted.Dispose();
+            queue.Stop();
+            await queue.Closed.DefaultTimeout();
+            listener.Dispose();
+            Assert.Null(await queue.AcceptAsync().AsTask().DefaultTimeout());
+            foreach (Socket client in clients)
+            {
+                try
+                {
+                    Assert.Equal(0, await client.ReceiveAsync(new byte[1], SocketFlags.None).DefaultTimeout());
+                }
+                catch (SocketException error) when (error.SocketErrorCode == SocketError.ConnectionReset)
+                {
+                }
+            }
+        }
+        finally
+        {
+            queue.Stop();
+            await queue.Closed.DefaultTimeout();
+            foreach (Socket? client in clients)
+            {
+                client?.Dispose();
+            }
+        }
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task MultishotPipeContractAllowsUnexamining(bool explicitExamined)
+    {
+        ReceiveSource source = new ReceiveSource();
+        IoUringPipeReader reader = new IoUringPipeReader(source.ReadAsync, PipeOptions.Default);
+        reader.Start();
+        try
+        {
+            source.Write(new TestOwner([0, 1, 2, 3]));
+            ReadResult result = await reader.ReadAsync().AsTask().DefaultTimeout();
+            reader.AdvanceTo(result.Buffer.GetPosition(1), result.Buffer.End);
+            source.Write(new TestOwner([4]));
+            result = await reader.ReadAsync().AsTask().DefaultTimeout();
+            Assert.Equal(new byte[] { 1, 2, 3, 4 }, result.Buffer.ToArray());
+            if (explicitExamined)
+            {
+                reader.AdvanceTo(result.Buffer.Start, result.Buffer.GetPosition(1));
+            }
+            else
+            {
+                reader.AdvanceTo(result.Buffer.Start);
+            }
+
+            result = await reader.ReadAsync().AsTask().DefaultTimeout();
+            Assert.Equal(new byte[] { 1, 2, 3, 4 }, result.Buffer.ToArray());
+            reader.AdvanceTo(result.Buffer.End);
+        }
+        finally
+        {
+            await reader.CompleteAsync().AsTask().DefaultTimeout();
+        }
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task MultishotPipeContractCanceledReadCanBeRetriedWithoutAdvancing(bool buffered)
+    {
+        ReceiveSource source = new ReceiveSource();
+        if (buffered)
+        {
+            source.Write(new TestOwner([1, 2, 3]));
+        }
+
+        IoUringPipeReader reader = new IoUringPipeReader(source.ReadAsync, PipeOptions.Default);
+        reader.Start();
+        try
+        {
+            reader.CancelPendingRead();
+            ReadResult canceled = await reader.ReadAsync().AsTask().DefaultTimeout();
+            Assert.True(canceled.IsCanceled);
+            Task<ReadResult> pending = reader.ReadAsync().AsTask();
+            if (!buffered)
+            {
+                source.Write(new TestOwner([1, 2, 3]));
+            }
+
+            ReadResult result = await pending.DefaultTimeout();
+            Assert.False(result.IsCanceled);
+            Assert.Equal(new byte[] { 1, 2, 3 }, result.Buffer.ToArray());
+            reader.AdvanceTo(result.Buffer.End);
+        }
+        finally
+        {
+            await reader.CompleteAsync().AsTask().DefaultTimeout();
+        }
+    }
+
+    [Fact]
+    public async Task MultishotPipeContractPrematureGetResultDoesNotRetirePendingRead()
+    {
+        ReceiveSource source = new ReceiveSource();
+        IoUringPipeReader reader = new IoUringPipeReader(source.ReadAsync, PipeOptions.Default);
+        reader.Start();
+        ValueTask<ReadResult> pending = reader.ReadAsync();
+        try
+        {
+            Assert.Throws<InvalidOperationException>(() => pending.GetAwaiter().GetResult());
+            Assert.Throws<InvalidOperationException>(() => reader.ReadAsync());
+            source.Write(new TestOwner([42]));
+            ReadResult result = await pending.AsTask().DefaultTimeout();
+            Assert.Equal(new byte[] { 42 }, result.Buffer.ToArray());
+            reader.AdvanceTo(result.Buffer.End);
+        }
+        finally
+        {
+            await reader.CompleteAsync().AsTask().DefaultTimeout();
+        }
+    }
+
+    [Fact]
+    public async Task MultishotPipeContractCustomSchedulerPreservesExecutionContext()
+    {
+        ReceiveSource source = new ReceiveSource();
+        IoUringPipeReader reader = new IoUringPipeReader(source.ReadAsync,
+            new PipeOptions(readerScheduler: new UnsafeScheduler(), useSynchronizationContext: false));
+        reader.Start();
+        try
+        {
+            AsyncLocal<int> local = new AsyncLocal<int> { Value = 42 };
+            TaskCompletionSource<int> completed = new TaskCompletionSource<int>(TaskCreationOptions.RunContinuationsAsynchronously);
+            ValueTaskAwaiter<ReadResult> awaiter = reader.ReadAsync().GetAwaiter();
+            awaiter.OnCompleted(() =>
+            {
+                ReadResult result = awaiter.GetResult();
+                reader.AdvanceTo(result.Buffer.End);
+                completed.SetResult(local.Value);
+            });
+            local.Value = 84;
+            source.Write(new TestOwner([42]));
+            Assert.Equal(42, await completed.Task.DefaultTimeout());
+        }
+        finally
+        {
+            await reader.CompleteAsync().AsTask().DefaultTimeout();
+        }
+    }
+
+    [Fact]
+    public async Task MultishotPipeContractUsesCapturedSynchronizationContext()
+    {
+        ReceiveSource source = new ReceiveSource();
+        IoUringPipeReader reader = new IoUringPipeReader(source.ReadAsync, PipeOptions.Default);
+        reader.Start();
+        QueuedSynchronizationContext context = new QueuedSynchronizationContext();
+        SynchronizationContext? previous = SynchronizationContext.Current;
+        TaskCompletionSource<SynchronizationContext?> completed =
+            new TaskCompletionSource<SynchronizationContext?>(TaskCreationOptions.RunContinuationsAsynchronously);
+        try
+        {
+            SynchronizationContext.SetSynchronizationContext(context);
+            ValueTaskAwaiter<ReadResult> awaiter = reader.ReadAsync().GetAwaiter();
+            awaiter.OnCompleted(() =>
+            {
+                ReadResult result = awaiter.GetResult();
+                reader.AdvanceTo(result.Buffer.End);
+                completed.SetResult(SynchronizationContext.Current);
+            });
+            SynchronizationContext.SetSynchronizationContext(previous);
+            source.Write(new TestOwner([42]));
+            (SendOrPostCallback callback, object? state) = await context.Posted.Reader.ReadAsync().AsTask().DefaultTimeout();
+            SynchronizationContext.SetSynchronizationContext(context);
+            callback(state);
+            SynchronizationContext.SetSynchronizationContext(previous);
+            Assert.Same(context, await completed.Task.DefaultTimeout());
+        }
+        finally
+        {
+            SynchronizationContext.SetSynchronizationContext(previous);
+            await reader.CompleteAsync().AsTask().DefaultTimeout();
+        }
+    }
+
+    [Fact]
+    public async Task MultishotPipeContractReadAtLeastCrossesPauseThreshold()
+    {
+        ReceiveSource source = new ReceiveSource();
+        IoUringPipeReader reader = new IoUringPipeReader(source.ReadAsync,
+            new PipeOptions(pauseWriterThreshold: 4, resumeWriterThreshold: 2));
+        reader.Start();
+        try
+        {
+            source.Write(new TestOwner([1, 2, 3, 4]));
+            source.Write(new TestOwner([5, 6, 7, 8]));
+            source.Write(new TestOwner([9, 10, 11, 12]));
+            ReadResult result = await reader.ReadAtLeastAsync(12).AsTask().DefaultTimeout();
+            Assert.Equal(new byte[] { 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12 }, result.Buffer.ToArray());
+            reader.AdvanceTo(result.Buffer.End);
+        }
+        finally
+        {
+            await reader.CompleteAsync().AsTask().DefaultTimeout();
+        }
+    }
+
+    [Fact]
+    public async Task MultishotPipeContractInlineCancellationCanReenterReader()
+    {
+        ReceiveSource source = new ReceiveSource();
+        IoUringPipeReader reader = new IoUringPipeReader(source.ReadAsync,
+            new PipeOptions(readerScheduler: PipeScheduler.Inline, useSynchronizationContext: false));
+        reader.Start();
+        try
+        {
+            int thread = Environment.CurrentManagedThreadId;
+            bool called = false;
+            ValueTaskAwaiter<ReadResult> awaiter = reader.ReadAsync().GetAwaiter();
+            awaiter.OnCompleted(() =>
+            {
+                Assert.Equal(thread, Environment.CurrentManagedThreadId);
+                ReadResult result = awaiter.GetResult();
+                Assert.True(result.IsCanceled);
+                Assert.False(reader.TryRead(out _));
+                called = true;
+            });
+            reader.CancelPendingRead();
+            Assert.True(called);
+        }
+        finally
+        {
+            await reader.CompleteAsync().AsTask().DefaultTimeout();
+        }
+    }
+
+    [Fact]
+    public async Task MultishotPipeContractBackpressureResumesStrictlyBelowThreshold()
+    {
+        ReceiveSource source = new ReceiveSource();
+        TaskCompletionSource paused = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        TaskCompletionSource resumed = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        CountingScheduler writerScheduler = new CountingScheduler();
+        IoUringPipeReader reader = new IoUringPipeReader(source.ReadAsync,
+            new PipeOptions(writerScheduler: writerScheduler, pauseWriterThreshold: 4, resumeWriterThreshold: 2),
+            onPause: value => (value ? paused : resumed).TrySetResult());
+        reader.Start();
+        try
+        {
+            source.Write(new TestOwner([1, 2, 3, 4]));
+            await paused.Task.DefaultTimeout();
+            ReadResult result = await reader.ReadAsync().AsTask().DefaultTimeout();
+            reader.AdvanceTo(result.Buffer.Start, result.Buffer.GetPosition(2));
+            Assert.False(resumed.Task.IsCompleted);
+            result = await reader.ReadAsync().AsTask().DefaultTimeout();
+            reader.AdvanceTo(result.Buffer.Start, result.Buffer.GetPosition(3));
+            await resumed.Task.DefaultTimeout();
+            Assert.Equal(1, writerScheduler.Scheduled);
+            result = await reader.ReadAsync().AsTask().DefaultTimeout();
+            reader.AdvanceTo(result.Buffer.End);
+        }
+        finally
+        {
+            await reader.CompleteAsync().AsTask().DefaultTimeout();
+        }
+    }
+
+    private sealed class QueuedSynchronizationContext : SynchronizationContext
+    {
+        public Channel<(SendOrPostCallback, object?)> Posted { get; } =
+            Channel.CreateUnbounded<(SendOrPostCallback, object?)>();
+
+        public override void Post(SendOrPostCallback callback, object? state) =>
+            Assert.True(Posted.Writer.TryWrite((callback, state)));
+    }
+
+    private sealed class UnsafeScheduler : PipeScheduler
+    {
+        public override void Schedule(Action<object?> action, object? state) =>
+            System.Threading.ThreadPool.UnsafeQueueUserWorkItem(static item => item.Action(item.State),
+                (Action: action, State: state), preferLocal: false);
+    }
+
+    private sealed class CountingScheduler : PipeScheduler
+    {
+        public int Scheduled { get; private set; }
+
+        public override void Schedule(Action<object?> action, object? state)
+        {
+            Scheduled++;
+            action(state);
+        }
+    }
+
+    private sealed class CountingPool : MemoryPool<byte>
+    {
+        public int Rented { get; private set; }
+        public override int MaxBufferSize => int.MaxValue;
+
+        public override IMemoryOwner<byte> Rent(int minBufferSize = -1)
+        {
+            Rented++;
+            return new TestOwner(new byte[Math.Max(1, minBufferSize)]);
+        }
+
+        protected override void Dispose(bool disposing)
+        {
+        }
+    }
+
+    private sealed class TestOwner(byte[] bytes) : IMemoryOwner<byte>
+    {
+        public Memory<byte> Memory => bytes;
+        public bool Disposed { get; private set; }
+
+        public void Dispose()
+        {
+            Assert.False(Disposed);
+            Disposed = true;
+            Array.Fill(bytes, (byte)0xff);
+        }
+    }
+
+    private sealed class ReceiveSource
+    {
+        private readonly Channel<IMemoryOwner<byte>> _channel = Channel.CreateUnbounded<IMemoryOwner<byte>>();
+        public TaskCompletionSource Stopped { get; } = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        public int Yielded { get; private set; }
+
+        public void Write(IMemoryOwner<byte> owner) => Assert.True(_channel.Writer.TryWrite(owner));
+        public void Complete(Exception? error = null) => _channel.Writer.TryComplete(error);
+
+        public async IAsyncEnumerable<IMemoryOwner<byte>> ReadAsync([EnumeratorCancellation] CancellationToken cancellationToken)
+        {
+            try
+            {
+                await foreach (IMemoryOwner<byte> owner in _channel.Reader.ReadAllAsync(cancellationToken))
+                {
+                    Yielded++;
+                    yield return owner;
+                }
+            }
+            finally
+            {
+                while (_channel.Reader.TryRead(out IMemoryOwner<byte>? owner))
+                {
+                    owner.Dispose();
+                }
+
+                Stopped.TrySetResult();
+            }
+        }
+    }
+
+#nullable restore
+
     [Fact]
     public async Task SocketTransportExposesSocketsFeature()
     {

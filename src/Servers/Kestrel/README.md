@@ -38,4 +38,19 @@ You can also run project specific tests by running `dotnet test` in the `tests` 
 
 ## More Information
 
+### Experimental io_uring socket transport
+
+This branch's socket transport requires the companion runtime's
+`Socket.AcceptMultishotAsync` and `Socket.ReceiveMultishotAsync` APIs.
+`DOTNET_USE_IO_URING=1` is the only enable switch; the transport selects the
+ordinary socket implementation when `System.Threading.IoUring.IsSupported` is false.
+The runtime receive enumerable also falls back when provided buffers are unavailable.
+
+Received buffers remain owned by the input reader until consumption. Fully consumed
+messages need no receive-side copy. Examined but retained partial messages are copied
+to ordinary pooled memory after `AdvanceTo`, returning their kernel-buffer leases so
+messages larger than the native pool can continue. Unexamined bytes apply the configured
+input backpressure. Connection teardown cancels and drains the receive enumerable,
+including when input is paused.
+
 For more information, see the [ASP.NET Core README](../../../README.md).

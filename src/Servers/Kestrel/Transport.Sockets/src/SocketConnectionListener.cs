@@ -16,6 +16,7 @@ internal sealed class SocketConnectionListener : IConnectionListener
     private readonly ILogger _logger;
     private Socket? _listenSocket;
     private readonly SocketTransportOptions _options;
+    private IoUringAcceptQueue? _acceptQueue;
 
     public EndPoint EndPoint { get; private set; }
 
@@ -54,10 +55,35 @@ internal sealed class SocketConnectionListener : IConnectionListener
         listenSocket.Listen(_options.Backlog);
 
         _listenSocket = listenSocket;
+
+        if (IoUringConnection.IsSupported)
+        {
+            _acceptQueue = new IoUringAcceptQueue(listenSocket, _options);
+            _acceptQueue.Start();
+        }
     }
 
     public async ValueTask<ConnectionContext?> AcceptAsync(CancellationToken cancellationToken = default)
     {
+        if (_acceptQueue is IoUringAcceptQueue acceptQueue)
+        {
+            Socket? acceptedSocket = await acceptQueue.AcceptAsync(cancellationToken);
+            if (acceptedSocket is null)
+            {
+                return null;
+            }
+
+            try
+            {
+                return _factory.Create(acceptedSocket);
+            }
+            catch
+            {
+                acceptedSocket.Dispose();
+                throw;
+            }
+        }
+
         while (true)
         {
             try
@@ -92,18 +118,27 @@ internal sealed class SocketConnectionListener : IConnectionListener
         }
     }
 
-    public ValueTask UnbindAsync(CancellationToken cancellationToken = default)
+    public async ValueTask UnbindAsync(CancellationToken cancellationToken = default)
     {
+        if (_acceptQueue is IoUringAcceptQueue acceptQueue)
+        {
+            acceptQueue.Stop();
+            await acceptQueue.Closed;
+        }
+
         _listenSocket?.Dispose();
-        return default;
     }
 
-    public ValueTask DisposeAsync()
+    public async ValueTask DisposeAsync()
     {
+        if (_acceptQueue is IoUringAcceptQueue acceptQueue)
+        {
+            acceptQueue.Stop();
+            await acceptQueue.Closed;
+        }
+
         _listenSocket?.Dispose();
 
         _factory.Dispose();
-
-        return default;
     }
 }

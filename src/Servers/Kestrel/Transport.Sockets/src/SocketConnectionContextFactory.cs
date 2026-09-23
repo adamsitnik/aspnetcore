@@ -87,19 +87,39 @@ public sealed class SocketConnectionContextFactory : IDisposable
     /// <returns></returns>
     public ConnectionContext Create(Socket socket)
     {
-        var setting = _settings[Interlocked.Increment(ref _settingsIndex) % _settingsCount];
+        QueueSettings setting = _settings[Interlocked.Increment(ref _settingsIndex) % _settingsCount];
 
-        var connection = new SocketConnection(socket,
-            setting.MemoryPool,
-            setting.SocketSenderPool.Scheduler,
-            _logger,
-            setting.SocketSenderPool,
-            setting.InputOptions,
-            setting.OutputOptions,
-            waitForData: _options.WaitForDataBeforeAllocatingBuffer,
-            finOnError: _options.FinOnError);
+        ConnectionContext connection;
 
-        connection.Start();
+        if (IoUringConnection.IsSupported)
+        {
+            IoUringConnection ioUringConnection = new IoUringConnection(socket,
+                setting.MemoryPool,
+                _logger,
+                setting.SocketSenderPool,
+                setting.InputOptions,
+                setting.OutputOptions,
+                finOnError: _options.FinOnError);
+
+            ioUringConnection.Start();
+            connection = ioUringConnection;
+        }
+        else
+        {
+            SocketConnection socketConnection = new SocketConnection(socket,
+                setting.MemoryPool,
+                setting.SocketSenderPool.Scheduler,
+                _logger,
+                setting.SocketSenderPool,
+                setting.InputOptions,
+                setting.OutputOptions,
+                waitForData: _options.WaitForDataBeforeAllocatingBuffer,
+                finOnError: _options.FinOnError);
+
+            socketConnection.Start();
+            connection = socketConnection;
+        }
+
         return connection;
     }
 
