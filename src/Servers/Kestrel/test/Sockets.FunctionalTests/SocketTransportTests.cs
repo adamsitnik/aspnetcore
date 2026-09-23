@@ -310,6 +310,13 @@ public class SocketTransportTests : LoggedTestBase
         reader.Start();
         try
         {
+            if (!IoUring.IsSupported)
+            {
+                await Assert.ThrowsAsync<InvalidOperationException>(
+                    () => reader.ReadAsync().AsTask().DefaultTimeout());
+                return;
+            }
+
             byte[] payload = new byte[retainExamined ? 1025 * 4096 + 17 : 8193];
             for (int index = 0; index < payload.Length; index++)
             {
@@ -464,35 +471,25 @@ public class SocketTransportTests : LoggedTestBase
     }
 
     [Fact]
-    public async Task MultishotAcceptCancellationDoesNotStopListener()
+    public async Task AcceptCancellationDoesNotStopListener()
     {
-        using Socket listener = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
-        listener.Bind(new IPEndPoint(IPAddress.Loopback, 0));
-        listener.Listen(4);
-        IoUringAcceptQueue queue = new IoUringAcceptQueue(listener, new SocketTransportOptions());
-        queue.Start();
-        try
-        {
-            using CancellationTokenSource cancellation = new CancellationTokenSource();
-            Task<Socket?> canceled = queue.AcceptAsync(cancellation.Token).AsTask();
-            cancellation.Cancel();
-            OperationCanceledException error = await Assert.ThrowsAnyAsync<OperationCanceledException>(() => canceled.DefaultTimeout());
-            Assert.Equal(cancellation.Token, error.CancellationToken);
+        await using SocketConnectionListener listener = new SocketConnectionListener(
+            new IPEndPoint(IPAddress.Loopback, 0), new SocketTransportOptions(), NullLoggerFactory.Instance);
+        listener.Bind();
+        using CancellationTokenSource cancellation = new CancellationTokenSource();
+        Task<ConnectionContext?> canceled = listener.AcceptAsync(cancellation.Token).AsTask();
+        cancellation.Cancel();
+        OperationCanceledException error = await Assert.ThrowsAnyAsync<OperationCanceledException>(() => canceled.DefaultTimeout());
+        Assert.Equal(cancellation.Token, error.CancellationToken);
 
-            using Socket client = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
-            await client.ConnectAsync(listener.LocalEndPoint!).DefaultTimeout();
-            using Socket? accepted = await queue.AcceptAsync().AsTask().DefaultTimeout();
-            Assert.NotNull(accepted);
-            Assert.True(accepted.NoDelay);
-            Task<Socket?> pending = queue.AcceptAsync().AsTask();
-            queue.Stop();
-            Assert.Null(await pending.DefaultTimeout());
-        }
-        finally
-        {
-            queue.Stop();
-            await queue.Closed.DefaultTimeout();
-        }
+        using Socket client = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
+        await client.ConnectAsync(listener.EndPoint).DefaultTimeout();
+        await using ConnectionContext? accepted = await listener.AcceptAsync().AsTask().DefaultTimeout();
+        Assert.NotNull(accepted);
+        Assert.True(accepted.Features.Get<IConnectionSocketFeature>()!.Socket.NoDelay);
+        Task<ConnectionContext?> pending = listener.AcceptAsync().AsTask();
+        await listener.UnbindAsync();
+        Assert.Null(await pending.DefaultTimeout());
     }
 
     [Fact]
@@ -533,11 +530,14 @@ public class SocketTransportTests : LoggedTestBase
         }
     }
 
-    [Fact]
-    public async Task MultishotReaderHonorsInputPoolAndScheduler()
+    [Theory]
+    [InlineData(3, int.MaxValue)]
+    [InlineData(4096, 4096)]
+    [InlineData(16384, 4096)]
+    public async Task MultishotReaderHonorsInputPoolAndScheduler(int bufferSize, int maxBufferSize)
     {
         ReceiveSource source = new ReceiveSource();
-        using CountingPool pool = new CountingPool();
+        using CountingPool pool = new CountingPool(maxBufferSize);
         CountingScheduler scheduler = new CountingScheduler();
         IoUringPipeReader reader = new IoUringPipeReader(source.ReadAsync,
             new PipeOptions(pool, scheduler, useSynchronizationContext: false));
@@ -545,18 +545,20 @@ public class SocketTransportTests : LoggedTestBase
         try
         {
             Task<ReadResult> pending = reader.ReadAsync().AsTask();
-            TestOwner owner = new TestOwner([1, 2, 3]);
+            byte[] expected = new byte[bufferSize];
+            new Random(42).NextBytes(expected);
+            TestOwner owner = new TestOwner((byte[])expected.Clone());
             source.Write(owner);
             ReadResult result = await pending.DefaultTimeout();
             Assert.Equal(1, scheduler.Scheduled);
             Assert.Equal(0, pool.Rented);
             Assert.False(owner.Disposed);
             reader.AdvanceTo(result.Buffer.Start, result.Buffer.End);
-            Assert.Equal(1, pool.Rented);
+            Assert.Equal(bufferSize <= maxBufferSize ? 1 : 0, pool.Rented);
             Assert.True(owner.Disposed);
             source.Complete();
             result = await reader.ReadAsync().AsTask().DefaultTimeout();
-            Assert.Equal(new byte[] { 1, 2, 3 }, result.Buffer.ToArray());
+            Assert.Equal(expected, result.Buffer.ToArray());
             reader.AdvanceTo(result.Buffer.End);
         }
         finally
@@ -581,54 +583,6 @@ public class SocketTransportTests : LoggedTestBase
         reader.AdvanceTo(result.Buffer.End);
         Assert.True(owner.Disposed);
         await reader.CompleteAsync().AsTask().DefaultTimeout();
-    }
-
-    [Fact]
-    public async Task MultishotAcceptStopDisposesUnclaimedSockets()
-    {
-        using Socket listener = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
-        listener.Bind(new IPEndPoint(IPAddress.Loopback, 0));
-        listener.Listen(4);
-        IoUringAcceptQueue queue = new IoUringAcceptQueue(listener, new SocketTransportOptions());
-        queue.Start();
-        Socket[] clients = new Socket[4];
-        try
-        {
-            for (int index = 0; index < clients.Length; index++)
-            {
-                clients[index] = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
-                await clients[index].ConnectAsync(listener.LocalEndPoint!).DefaultTimeout();
-            }
-
-            // Claim one socket so the accept pump has definitely started, but leave the
-            // remaining sockets for listener/enumerator disposal rather than the application.
-            using Socket? accepted = await queue.AcceptAsync().AsTask().DefaultTimeout();
-            Assert.NotNull(accepted);
-            accepted.Dispose();
-            queue.Stop();
-            await queue.Closed.DefaultTimeout();
-            listener.Dispose();
-            Assert.Null(await queue.AcceptAsync().AsTask().DefaultTimeout());
-            foreach (Socket client in clients)
-            {
-                try
-                {
-                    Assert.Equal(0, await client.ReceiveAsync(new byte[1], SocketFlags.None).DefaultTimeout());
-                }
-                catch (SocketException error) when (error.SocketErrorCode == SocketError.ConnectionReset)
-                {
-                }
-            }
-        }
-        finally
-        {
-            queue.Stop();
-            await queue.Closed.DefaultTimeout();
-            foreach (Socket? client in clients)
-            {
-                client?.Dispose();
-            }
-        }
     }
 
     [Theory]
@@ -895,13 +849,14 @@ public class SocketTransportTests : LoggedTestBase
         }
     }
 
-    private sealed class CountingPool : MemoryPool<byte>
+    private sealed class CountingPool(int maxBufferSize = int.MaxValue) : MemoryPool<byte>
     {
         public int Rented { get; private set; }
-        public override int MaxBufferSize => int.MaxValue;
+        public override int MaxBufferSize => maxBufferSize;
 
         public override IMemoryOwner<byte> Rent(int minBufferSize = -1)
         {
+            ArgumentOutOfRangeException.ThrowIfGreaterThan(minBufferSize, MaxBufferSize);
             Rented++;
             return new TestOwner(new byte[Math.Max(1, minBufferSize)]);
         }

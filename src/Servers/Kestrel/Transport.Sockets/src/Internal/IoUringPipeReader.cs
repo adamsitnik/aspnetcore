@@ -9,8 +9,8 @@ using System.Threading.Tasks.Sources;
 
 namespace Microsoft.AspNetCore.Server.Kestrel.Transport.Sockets.Internal;
 
-// Owns yielded receive buffers until consumption. The runtime owns cancellation, native
-// draining, and the ordinary-receive fallback when multishot receive is unavailable.
+// Owns yielded receive buffers until consumption. The runtime owns cancellation,
+// native draining, and rearming after provided-buffer exhaustion.
 internal sealed class IoUringPipeReader : PipeReader, IValueTaskSource<ReadResult>
 {
     private readonly Lock _lock = new();

@@ -49,7 +49,9 @@ internal sealed class IoUringBufferSegment : ReadOnlySequenceSegment<byte>
             return;
         }
 
-        IMemoryOwner<byte> replacement = pool.Rent(Memory.Length);
+        IMemoryOwner<byte> replacement = Memory.Length <= pool.MaxBufferSize
+            ? pool.Rent(Memory.Length)
+            : MemoryPool<byte>.Shared.Rent(Memory.Length);
         Memory<byte> memory = replacement.Memory[..Memory.Length];
         Memory.CopyTo(memory);
         Owner.Dispose();
