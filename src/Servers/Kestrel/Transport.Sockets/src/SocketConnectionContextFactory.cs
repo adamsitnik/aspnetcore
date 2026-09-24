@@ -93,7 +93,7 @@ public sealed class SocketConnectionContextFactory : IDisposable
 
         if (IoUringMultishotConnection.IsSupported)
         {
-            IoUringMultishotConnection ioUringMultishotConnection = new IoUringMultishotConnection(socket,
+            IoUringMultishotConnection ioUringMultishotConnection = new(socket,
                 setting.MemoryPool,
                 _logger,
                 setting.SocketSenderPool,
