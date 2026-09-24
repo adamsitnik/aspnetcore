@@ -20,6 +20,8 @@ internal sealed class IoUringPipeReader : PipeReader, IValueTaskSource<ReadResul
     private readonly Action<bool>? _onPause;
     private readonly CancellationTokenSource _stop = new();
     private readonly TaskCompletionSource _closed = new(TaskCreationOptions.RunContinuationsAsynchronously);
+    // Leave RunContinuationsAsynchronously false to reuse the receive-completion worker.
+    // ReadCompletion.Publish handles the worker handoff when completion originates elsewhere.
     private ManualResetValueTaskSourceCore<ReadResult> _readSource;
     private CancellationTokenRegistration _readCancellation;
     private IoUringBufferSegment? _head;
@@ -75,6 +77,8 @@ internal sealed class IoUringPipeReader : PipeReader, IValueTaskSource<ReadResul
         _ = ReceiveAsync();
     }
 
+    // The receive loop runs for the connection's lifetime; request optimized code up front
+    // rather than relying on tiered promotion during steady-state request processing.
     [MethodImpl(MethodImplOptions.AggressiveOptimization)]
     private async Task ReceiveAsync()
     {
@@ -251,6 +255,8 @@ internal sealed class IoUringPipeReader : PipeReader, IValueTaskSource<ReadResul
 
         if (_cancelNextRead || _writerCompleted || _written > _examined)
         {
+            // A single buffer needs no linked-segment bookkeeping in the sequence exposed to the parser.
+            // Use a segment-backed sequence only for reads that actually span multiple buffers.
             _readBuffer = _head is null ? ReadOnlySequence<byte>.Empty :
                 _head == _tail ? new ReadOnlySequence<byte>(_head.Memory[_headOffset..]) :
                 new ReadOnlySequence<byte>(_head, _headOffset, _tail!, _tail!.Memory.Length);
@@ -276,6 +282,8 @@ internal sealed class IoUringPipeReader : PipeReader, IValueTaskSource<ReadResul
                 throw new InvalidOperationException("There is no read result to advance.");
             }
 
+            // Fully consumed reads commonly also examine everything. Reuse the known lengths
+            // instead of constructing sequence slices twice on that path.
             long consumedLength = consumed.Equals(_readBuffer.End) ? _readBuffer.Length : _readBuffer.Slice(0, consumed).Length;
             long examinedLength = examined.Equals(consumed) ? consumedLength : _readBuffer.Slice(0, examined).Length;
             if (consumedLength > examinedLength)
@@ -515,8 +523,9 @@ internal sealed class IoUringPipeReader : PipeReader, IValueTaskSource<ReadResul
         {
             if (_ready)
             {
-                // io_uring already dispatches onto workers. Only external completion/cancellation
-                // needs a hop to honor the ThreadPool scheduler.
+                // The runtime dispatches io_uring completions on workers, not issuer threads.
+                // Resume the reader inline there to avoid another ThreadPool queue hop per read.
+                // Non-worker completion/cancellation still needs a handoff to honor the scheduler.
                 if (reader._options.ReaderScheduler == PipeScheduler.ThreadPool && !Thread.CurrentThread.IsThreadPoolThread)
                 {
                     ThreadPool.UnsafeQueueUserWorkItem(static state => state.Completion.Publish(state.Reader),

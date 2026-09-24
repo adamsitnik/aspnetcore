@@ -12,7 +12,6 @@ namespace Microsoft.AspNetCore.Server.Kestrel.Transport.Sockets.Internal;
 
 // Receives owned multishot buffers without copying on the common, fully-consumed path.
 // Output retains SocketConnection's ordinary Pipe and pooled SocketSender fast path.
-// Send continuations use the ThreadPool directly rather than shared IOQueue instances.
 internal sealed partial class IoUringConnection : TransportConnection
 {
     private readonly Socket _socket;
@@ -61,6 +60,9 @@ internal sealed partial class IoUringConnection : TransportConnection
         _receiveReader = new IoUringPipeReader(socket, inputOptions, OnReceiveCompleted, OnReceivePaused);
         if (outputOptions.ReaderScheduler is IOQueue)
         {
+            // IOQueue serializes send-loop continuations across connections sharing that queue.
+            // Scheduling directly on the ThreadPool removes that shared bottleneck and queue hop,
+            // while each connection's single send loop still preserves its write order.
             outputOptions = new PipeOptions(outputOptions.Pool, PipeScheduler.ThreadPool, outputOptions.WriterScheduler,
                 outputOptions.PauseWriterThreshold, outputOptions.ResumeWriterThreshold,
                 outputOptions.MinimumSegmentSize, outputOptions.UseSynchronizationContext);
