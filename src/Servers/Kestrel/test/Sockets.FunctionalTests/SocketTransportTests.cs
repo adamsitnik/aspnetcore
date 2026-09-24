@@ -31,6 +31,69 @@ namespace Microsoft.AspNetCore.Server.Kestrel.Sockets.FunctionalTests;
 
 public class SocketTransportTests : LoggedTestBase
 {
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task MultishotReaderThreadPoolSchedulerReusesCompletionWorker(bool worker)
+    {
+        ReceiveSource source = new ReceiveSource();
+        IoUringPipeReader reader = new IoUringPipeReader(source.ReadAsync,
+            new PipeOptions(useSynchronizationContext: false));
+        reader.Start();
+        TaskCompletionSource completed = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        TaskCompletionSource published = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        bool inline = false;
+        ValueTaskAwaiter<ReadResult> awaiter = reader.ReadAsync().GetAwaiter();
+        awaiter.UnsafeOnCompleted(() =>
+        {
+            try
+            {
+                Assert.True(Thread.CurrentThread.IsThreadPoolThread);
+                ReadResult result = awaiter.GetResult();
+                Assert.True(result.IsCanceled);
+                reader.AdvanceTo(result.Buffer.End);
+                inline = true;
+                completed.SetResult();
+            }
+            catch (Exception error)
+            {
+                completed.SetException(error);
+            }
+        });
+        void Publish()
+        {
+            try
+            {
+                reader.CancelPendingRead();
+                if (worker)
+                {
+                    Assert.True(inline);
+                }
+                published.SetResult();
+            }
+            catch (Exception error)
+            {
+                published.SetException(error);
+            }
+        }
+        try
+        {
+            if (worker)
+            {
+                ThreadPool.UnsafeQueueUserWorkItem(static action => action(), (Action)Publish, preferLocal: false);
+            }
+            else
+            {
+                new Thread(Publish) { IsBackground = true }.Start();
+            }
+            await Task.WhenAll(published.Task, completed.Task).DefaultTimeout();
+        }
+        finally
+        {
+            await reader.CompleteAsync().AsTask().DefaultTimeout();
+        }
+    }
+
     [Fact]
     public async Task MultishotReaderPreservesOrderAndPartialConsumption()
     {

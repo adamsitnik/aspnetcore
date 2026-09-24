@@ -20,7 +20,7 @@ internal sealed class IoUringPipeReader : PipeReader, IValueTaskSource<ReadResul
     private readonly Action<bool>? _onPause;
     private readonly CancellationTokenSource _stop = new();
     private readonly TaskCompletionSource _closed = new(TaskCreationOptions.RunContinuationsAsynchronously);
-    private ManualResetValueTaskSourceCore<ReadResult> _readSource = new() { RunContinuationsAsynchronously = true };
+    private ManualResetValueTaskSourceCore<ReadResult> _readSource;
     private CancellationTokenRegistration _readCancellation;
     private IoUringBufferSegment? _head;
     private IoUringBufferSegment? _tail;
@@ -55,7 +55,6 @@ internal sealed class IoUringPipeReader : PipeReader, IValueTaskSource<ReadResul
         _options = options;
         _onCompleted = onCompleted;
         _onPause = onPause;
-        _readSource.RunContinuationsAsynchronously = options.ReaderScheduler == PipeScheduler.ThreadPool;
     }
 
     public Task Closed => _closed.Task;
@@ -365,7 +364,7 @@ internal sealed class IoUringPipeReader : PipeReader, IValueTaskSource<ReadResul
 
         if (canceled)
         {
-            _readSource.SetException(new OperationCanceledException(token));
+            new ReadCompletion(default, new OperationCanceledException(token)).Publish(this);
         }
     }
 
@@ -513,6 +512,15 @@ internal sealed class IoUringPipeReader : PipeReader, IValueTaskSource<ReadResul
         {
             if (_ready)
             {
+                // io_uring already dispatches onto workers. Only external completion/cancellation
+                // needs a hop to honor the ThreadPool scheduler.
+                if (reader._options.ReaderScheduler == PipeScheduler.ThreadPool && !Thread.CurrentThread.IsThreadPoolThread)
+                {
+                    ThreadPool.UnsafeQueueUserWorkItem(static state => state.Completion.Publish(state.Reader),
+                        (Reader: reader, Completion: this), preferLocal: false);
+                    return;
+                }
+
                 if (error is null)
                 {
                     reader._readSource.SetResult(result);
