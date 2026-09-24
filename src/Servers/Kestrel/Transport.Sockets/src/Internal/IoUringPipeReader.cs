@@ -44,7 +44,8 @@ internal sealed class IoUringPipeReader : PipeReader, IValueTaskSource<ReadResul
 
     public IoUringPipeReader(Socket socket, PipeOptions options,
         Func<Exception?, Exception?>? onCompleted = null, Action<bool>? onPause = null)
-        : this(socket.ReceiveMultishotAsync, options, onCompleted, onPause)
+        : this(OperatingSystem.IsLinux() ? socket.ReceiveMultishotAsync : throw new PlatformNotSupportedException(),
+            options, onCompleted, onPause)
     {
     }
 
