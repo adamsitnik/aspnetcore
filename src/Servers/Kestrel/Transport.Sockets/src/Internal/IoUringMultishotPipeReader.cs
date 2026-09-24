@@ -13,6 +13,8 @@ namespace Microsoft.AspNetCore.Server.Kestrel.Transport.Sockets.Internal;
 // native draining, and rearming after provided-buffer exhaustion.
 internal sealed class IoUringMultishotPipeReader : PipeReader, IValueTaskSource<ReadResult>
 {
+    // Protects the shared buffer chain, backpressure, and completion/cancellation handoff.
+    // Application continuations must run outside this lock.
     private readonly Lock _lock = new();
     private readonly Func<CancellationToken, IAsyncEnumerable<IMemoryOwner<byte>>> _receive;
     private readonly PipeOptions _options;
@@ -32,17 +34,24 @@ internal sealed class IoUringMultishotPipeReader : PipeReader, IValueTaskSource<
     private long _written;
     private long _consumed;
     private long _examined;
+    // Only the single reader changes this state; the producer publishes an immutable ReadResult.
     private ReadOnlySequence<byte> _readBuffer;
+    private ReadState _readState;
     private TaskCompletionSource? _resume;
     private Exception? _error;
     private bool _started;
     private bool _readerCompleted;
     private bool _writerCompleted;
-    private bool _readOutstanding;
     private bool _awaiterPending;
-    private bool _readActive;
-    private bool _readCanceled;
     private bool _cancelNextRead;
+
+    private enum ReadState : byte
+    {
+        None,
+        Pending,
+        Active,
+        Canceled
+    }
 
     public IoUringMultishotPipeReader(Socket socket, PipeOptions options,
         Func<Exception?, Exception?>? onCompleted = null, Action<bool>? onPause = null)
@@ -201,11 +210,12 @@ internal sealed class IoUringMultishotPipeReader : PipeReader, IValueTaskSource<
 
             if (TryReadCore(out ReadResult result))
             {
-                return new ValueTask<ReadResult>(result);
+                return new ValueTask<ReadResult>(SetReadResult(result));
             }
 
             _readSource.Reset();
-            _readOutstanding = _awaiterPending = true;
+            _readState = ReadState.Pending;
+            _awaiterPending = true;
             short version = _readSource.Version;
             if (cancellationToken.CanBeCanceled)
             {
@@ -226,7 +236,13 @@ internal sealed class IoUringMultishotPipeReader : PipeReader, IValueTaskSource<
         lock (_lock)
         {
             ValidateRead();
-            return TryReadCore(out result);
+            if (!TryReadCore(out result))
+            {
+                return false;
+            }
+
+            SetReadResult(result);
+            return true;
         }
     }
 
@@ -237,13 +253,20 @@ internal sealed class IoUringMultishotPipeReader : PipeReader, IValueTaskSource<
             throw new InvalidOperationException("Reading is not allowed after the reader was completed.");
         }
 
-        if ((_readActive && !_readCanceled) || _readOutstanding)
+        if (_readState is ReadState.Active or ReadState.Pending)
         {
             throw new InvalidOperationException("The previous read must be advanced before reading again.");
         }
 
-        _readActive = false;
+        _readState = ReadState.None;
         _readBuffer = default;
+    }
+
+    private ReadResult SetReadResult(ReadResult result)
+    {
+        _readBuffer = result.Buffer;
+        _readState = result.IsCanceled ? ReadState.Canceled : ReadState.Active;
+        return result;
     }
 
     private bool TryReadCore(out ReadResult result)
@@ -257,13 +280,11 @@ internal sealed class IoUringMultishotPipeReader : PipeReader, IValueTaskSource<
         {
             // A single buffer needs no linked-segment bookkeeping in the sequence exposed to the parser.
             // Use a segment-backed sequence only for reads that actually span multiple buffers.
-            _readBuffer = _head is null ? ReadOnlySequence<byte>.Empty :
+            ReadOnlySequence<byte> buffer = _head is null ? ReadOnlySequence<byte>.Empty :
                 _head == _tail ? new ReadOnlySequence<byte>(_head.Memory[_headOffset..]) :
                 new ReadOnlySequence<byte>(_head, _headOffset, _tail!, _tail!.Memory.Length);
-            result = new ReadResult(_readBuffer, _cancelNextRead, _writerCompleted);
-            _readCanceled = _cancelNextRead;
+            result = new ReadResult(buffer, _cancelNextRead, _writerCompleted);
             _cancelNextRead = false;
-            _readActive = true;
             return true;
         }
 
@@ -277,7 +298,7 @@ internal sealed class IoUringMultishotPipeReader : PipeReader, IValueTaskSource<
     {
         lock (_lock)
         {
-            if (!_readActive)
+            if (_readerCompleted || _readState is not (ReadState.Active or ReadState.Canceled))
             {
                 throw new InvalidOperationException("There is no read result to advance.");
             }
@@ -293,7 +314,7 @@ internal sealed class IoUringMultishotPipeReader : PipeReader, IValueTaskSource<
 
             _examined = _consumed + examinedLength;
             _consumed += consumedLength;
-            _readActive = false;
+            _readState = ReadState.None;
             _readBuffer = default;
 
             while (_head is not null && consumedLength >= _head.Memory.Length - _headOffset)
@@ -386,6 +407,7 @@ internal sealed class IoUringMultishotPipeReader : PipeReader, IValueTaskSource<
             return default;
         }
 
+        ReadCompletion completion;
         try
         {
             if (_readerCompleted)
@@ -398,16 +420,16 @@ internal sealed class IoUringMultishotPipeReader : PipeReader, IValueTaskSource<
                 return default;
             }
 
-            _awaiterPending = false;
-            _readCancellation.Unregister();
-            return new ReadCompletion(result, null);
+            completion = new ReadCompletion(result, null);
         }
         catch (Exception ex)
         {
-            _awaiterPending = false;
-            _readCancellation.Unregister();
-            return new ReadCompletion(default, ex);
+            completion = new ReadCompletion(default, ex);
         }
+
+        _awaiterPending = false;
+        _readCancellation.Unregister();
+        return completion;
     }
 
     public override void Complete(Exception? exception = null)
@@ -421,7 +443,6 @@ internal sealed class IoUringMultishotPipeReader : PipeReader, IValueTaskSource<
             }
 
             _readerCompleted = true;
-            _readActive = false;
             _readBuffer = default;
             completion = CompletePendingRead();
             while (_head is not null)
@@ -472,23 +493,25 @@ internal sealed class IoUringMultishotPipeReader : PipeReader, IValueTaskSource<
 
     ReadResult IValueTaskSource<ReadResult>.GetResult(short token)
     {
-        lock (_lock)
+        // GetStatus/GetResult acquire the value-task source's completion publication.
+        // Retiring the pending read is consumer-only work, so it needs no second lock.
+        if (_readSource.GetStatus(token) == ValueTaskSourceStatus.Pending || _readState != ReadState.Pending)
         {
-            if (_readSource.GetStatus(token) == ValueTaskSourceStatus.Pending || !_readOutstanding)
-            {
-                throw new InvalidOperationException("The pending read has not completed or has already been retrieved.");
-            }
-
-            try
-            {
-                return _readSource.GetResult(token);
-            }
-            finally
-            {
-                _readCancellation.Unregister();
-                _readOutstanding = false;
-            }
+            throw new InvalidOperationException("The pending read has not completed or has already been retrieved.");
         }
+
+        ReadResult result;
+        try
+        {
+            result = _readSource.GetResult(token);
+        }
+        finally
+        {
+            _readCancellation.Unregister();
+            _readState = ReadState.None;
+        }
+
+        return SetReadResult(result);
     }
 
     ValueTaskSourceStatus IValueTaskSource<ReadResult>.GetStatus(short token) => _readSource.GetStatus(token);

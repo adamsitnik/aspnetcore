@@ -987,6 +987,112 @@ public class SocketTransportTests : LoggedTestBase
         }
     }
 
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task MultishotReaderStaleResultDoesNotRetireNextRead(bool useToken)
+    {
+        ReceiveSource source = new ReceiveSource();
+        IoUringMultishotPipeReader reader = new(source.ReadAsync,
+            new PipeOptions(readerScheduler: PipeScheduler.Inline, useSynchronizationContext: false));
+        using CancellationTokenSource cancellation = new();
+        reader.Start();
+        try
+        {
+            ValueTask<ReadResult> first = reader.ReadAsync(useToken ? cancellation.Token : default);
+            if (useToken)
+            {
+                cancellation.Cancel();
+                OperationCanceledException error = Assert.ThrowsAny<OperationCanceledException>(
+                    () => first.GetAwaiter().GetResult());
+                Assert.Equal(cancellation.Token, error.CancellationToken);
+            }
+            else
+            {
+                reader.CancelPendingRead();
+                ReadResult canceled = await first;
+                Assert.True(canceled.IsCanceled);
+                reader.AdvanceTo(canceled.Buffer.End);
+            }
+
+            ValueTask<ReadResult> second = reader.ReadAsync();
+            Assert.Throws<InvalidOperationException>(() => first.GetAwaiter().GetResult());
+            Assert.Throws<InvalidOperationException>(() => reader.TryRead(out _));
+
+            source.Write(new TestOwner([42]));
+            ReadResult result = await second.AsTask().DefaultTimeout();
+            Assert.Equal(new byte[] { 42 }, result.Buffer.ToArray());
+            reader.AdvanceTo(result.Buffer.End);
+        }
+        finally
+        {
+            await reader.CompleteAsync().AsTask().DefaultTimeout();
+        }
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task MultishotReaderReceiveRacingCancellationPreservesData(bool useToken)
+    {
+        for (int iteration = 0; iteration < 32; iteration++)
+        {
+            ReceiveSource source = new ReceiveSource();
+            IoUringMultishotPipeReader reader = new(source.ReadAsync,
+                new PipeOptions(useSynchronizationContext: false));
+            using CancellationTokenSource cancellation = new();
+            TestOwner owner = new([1, 2, 3, 4]);
+            reader.Start();
+            try
+            {
+                ValueTask<ReadResult> pending = reader.ReadAsync(useToken ? cancellation.Token : default);
+                await Task.WhenAll(Task.Run(() => source.Write(owner)), Task.Run(() =>
+                {
+                    if (useToken)
+                    {
+                        cancellation.Cancel();
+                    }
+                    else
+                    {
+                        reader.CancelPendingRead();
+                    }
+                })).DefaultTimeout();
+                source.Complete();
+
+                ReadResult result;
+                try
+                {
+                    result = await pending.AsTask().DefaultTimeout();
+                }
+                catch (OperationCanceledException error) when (useToken)
+                {
+                    Assert.Equal(cancellation.Token, error.CancellationToken);
+                    result = await reader.ReadAsync().AsTask().DefaultTimeout();
+                }
+
+                List<byte> received = new();
+                while (true)
+                {
+                    received.AddRange(result.Buffer.ToArray());
+                    reader.AdvanceTo(result.Buffer.End);
+                    if (result.IsCompleted)
+                    {
+                        break;
+                    }
+
+                    result = await reader.ReadAsync().AsTask().DefaultTimeout();
+                }
+
+                Assert.Equal(new byte[] { 1, 2, 3, 4 }, received);
+                Assert.True(owner.Disposed);
+            }
+            finally
+            {
+                await reader.CompleteAsync().AsTask().DefaultTimeout();
+            }
+        }
+    }
+
     [Fact]
     public async Task MultishotPipeContractUsesCapturedSynchronizationContext()
     {
