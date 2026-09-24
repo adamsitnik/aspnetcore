@@ -515,6 +515,133 @@ public class SocketTransportTests : LoggedTestBase
         }
     }
 
+    [Theory]
+    [InlineData(false, false, true)]
+    [InlineData(true, false, true)]
+    [InlineData(false, true, true)]
+    [InlineData(true, true, true)]
+    [InlineData(false, true, false)]
+    public async Task MultishotConnectionsSendAndDisposeWithOutputBackpressure(bool abort, bool writeOnWorker, bool large)
+    {
+        using Socket listener = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
+        listener.Bind(new IPEndPoint(IPAddress.Loopback, 0));
+        listener.Listen(4);
+        using SocketConnectionContextFactory factory = new SocketConnectionContextFactory(
+            new SocketConnectionFactoryOptions { IOQueueCount = 1, MaxWriteBufferSize = 1024 }, NullLogger.Instance);
+        List<(Socket Client, ConnectionContext Connection, Task<FlushResult> Flush)> connections = new();
+        List<Socket> sockets = new();
+        List<ConnectionContext> ownedConnections = new();
+        byte[] payload = new byte[large ? 128 * 4096 + 17 : 17];
+        for (int index = 0; index < payload.Length; index++)
+        {
+            payload[index] = (byte)(index % 251);
+        }
+
+        try
+        {
+            for (int index = 0; index < 4; index++)
+            {
+                Socket client = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
+                sockets.Add(client);
+                client.ReceiveBufferSize = 4096;
+                Task connecting = client.ConnectAsync(listener.LocalEndPoint!);
+                Socket server = await listener.AcceptAsync().DefaultTimeout();
+                sockets.Add(server);
+                await connecting.DefaultTimeout();
+                server.SendBufferSize = 4096;
+                ConnectionContext connection = factory.Create(server);
+                ownedConnections.Add(connection);
+                Task<FlushResult> flush = await Task.Factory.StartNew(() =>
+                {
+                    Assert.Equal(writeOnWorker, Thread.CurrentThread.IsThreadPoolThread);
+                    return connection.Transport.Output.WriteAsync(payload).AsTask();
+                }, CancellationToken.None, writeOnWorker ? TaskCreationOptions.None : TaskCreationOptions.LongRunning, TaskScheduler.Default);
+                connections.Add((client, connection, flush));
+                if (large)
+                {
+                    Assert.False(flush.IsCompleted);
+                }
+            }
+
+            await Task.WhenAll(connections.Select(async item =>
+            {
+                if (abort)
+                {
+                    item.Connection.Abort(new ConnectionAbortedException("Test output abort"));
+                    await item.Connection.DisposeAsync().AsTask().DefaultTimeout();
+                    Assert.True((await item.Flush.DefaultTimeout()).IsCompleted);
+                    return;
+                }
+
+                byte[] buffer = new byte[65536];
+                int received = 0;
+                while (received < payload.Length)
+                {
+                    int count = await item.Client.ReceiveAsync(buffer, SocketFlags.None).DefaultTimeout();
+                    Assert.True(count > 0);
+                    Assert.Equal(payload.AsSpan(received, count).ToArray(), buffer.AsSpan(0, count).ToArray());
+                    received += count;
+                }
+
+                Assert.False((await item.Flush.DefaultTimeout()).IsCanceled);
+                await item.Connection.DisposeAsync().AsTask().DefaultTimeout();
+            })).DefaultTimeout();
+        }
+        finally
+        {
+            foreach (Socket socket in sockets)
+            {
+                socket.Dispose();
+            }
+            foreach (ConnectionContext connection in ownedConnections)
+            {
+                await connection.DisposeAsync().AsTask().DefaultTimeout();
+            }
+        }
+    }
+
+    [Fact]
+    public async Task MultishotOutputDoesNotFlowProducerExecutionContext()
+    {
+        using Socket listener = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
+        listener.Bind(new IPEndPoint(IPAddress.Loopback, 0));
+        listener.Listen(1);
+        using Socket client = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
+        Task connecting = client.ConnectAsync(listener.LocalEndPoint!);
+        Socket server = await listener.AcceptAsync().DefaultTimeout();
+        await connecting.DefaultTimeout();
+        using SocketConnectionContextFactory factory = new SocketConnectionContextFactory(
+            new SocketConnectionFactoryOptions { IOQueueCount = 1 }, NullLogger.Instance);
+        await using ConnectionContext connection = factory.Create(server);
+        int workerTransitions = 0;
+        AsyncLocal<bool> producerContext = new AsyncLocal<bool>(change =>
+        {
+            if (change.ThreadContextChanged && change.CurrentValue && Thread.CurrentThread.IsThreadPoolThread)
+            {
+                Interlocked.Increment(ref workerTransitions);
+            }
+        });
+
+        Task<FlushResult> flush = await Task.Factory.StartNew(() =>
+        {
+            Assert.False(Thread.CurrentThread.IsThreadPoolThread);
+            producerContext.Value = true;
+            try
+            {
+                return connection.Transport.Output.WriteAsync(new byte[] { 42 }).AsTask();
+            }
+            finally
+            {
+                producerContext.Value = false;
+            }
+        }, CancellationToken.None, TaskCreationOptions.LongRunning, TaskScheduler.Default);
+        byte[] received = new byte[1];
+        Assert.Equal(1, await client.ReceiveAsync(received, SocketFlags.None).DefaultTimeout());
+        Assert.Equal(42, received[0]);
+        await flush.DefaultTimeout();
+        Assert.Equal(0, Volatile.Read(ref workerTransitions));
+    }
+
     [Fact]
     public async Task MultishotConnectionMapsPeerResetToPendingRead()
     {
