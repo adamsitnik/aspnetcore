@@ -6,7 +6,7 @@ using Microsoft.AspNetCore.Connections.Features;
 
 namespace Microsoft.AspNetCore.Server.Kestrel.Transport.Sockets.Internal;
 
-internal sealed partial class IoUringConnection : IConnectionSocketFeature
+internal sealed partial class IoUringMultishotConnection : IConnectionSocketFeature
 {
     public Socket Socket => _socket;
 

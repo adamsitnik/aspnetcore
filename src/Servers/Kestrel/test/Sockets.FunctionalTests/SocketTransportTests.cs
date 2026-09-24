@@ -37,7 +37,7 @@ public class SocketTransportTests : LoggedTestBase
     public async Task MultishotReaderThreadPoolSchedulerReusesCompletionWorker(bool worker)
     {
         ReceiveSource source = new ReceiveSource();
-        IoUringPipeReader reader = new IoUringPipeReader(source.ReadAsync,
+        IoUringMultishotPipeReader reader = new IoUringMultishotPipeReader(source.ReadAsync,
             new PipeOptions(useSynchronizationContext: false));
         reader.Start();
         TaskCompletionSource completed = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
@@ -98,7 +98,7 @@ public class SocketTransportTests : LoggedTestBase
     public async Task MultishotReaderPreservesOrderAndPartialConsumption()
     {
         ReceiveSource source = new ReceiveSource();
-        IoUringPipeReader reader = new IoUringPipeReader(source.ReadAsync, PipeOptions.Default);
+        IoUringMultishotPipeReader reader = new IoUringMultishotPipeReader(source.ReadAsync, PipeOptions.Default);
         reader.Start();
         try
         {
@@ -157,7 +157,7 @@ public class SocketTransportTests : LoggedTestBase
             }
         }
 
-        IoUringPipeReader reader = new IoUringPipeReader(Receive,
+        IoUringMultishotPipeReader reader = new IoUringMultishotPipeReader(Receive,
             new PipeOptions(pauseWriterThreshold: BufferSize, resumeWriterThreshold: BufferSize / 2));
         reader.Start();
         try
@@ -191,7 +191,7 @@ public class SocketTransportTests : LoggedTestBase
     public async Task MultishotReaderCancellationDoesNotCancelReceive(bool useToken)
     {
         ReceiveSource source = new ReceiveSource();
-        IoUringPipeReader reader = new IoUringPipeReader(source.ReadAsync, PipeOptions.Default);
+        IoUringMultishotPipeReader reader = new IoUringMultishotPipeReader(source.ReadAsync, PipeOptions.Default);
         reader.Start();
         using CancellationTokenSource cancellation = new CancellationTokenSource();
         try
@@ -230,7 +230,7 @@ public class SocketTransportTests : LoggedTestBase
     public async Task MultishotReaderCompletesPendingReadOnErrorOrEof(bool error)
     {
         ReceiveSource source = new ReceiveSource();
-        IoUringPipeReader reader = new IoUringPipeReader(source.ReadAsync, PipeOptions.Default);
+        IoUringMultishotPipeReader reader = new IoUringMultishotPipeReader(source.ReadAsync, PipeOptions.Default);
         reader.Start();
         Task<ReadResult> pending = reader.ReadAsync().AsTask();
         SocketException reset = new SocketException((int)SocketError.ConnectionReset);
@@ -264,7 +264,7 @@ public class SocketTransportTests : LoggedTestBase
     public async Task MultishotReaderCleanupCancelsPendingOrPausedReceive(bool paused, bool abort)
     {
         ReceiveSource source = new ReceiveSource();
-        IoUringPipeReader reader = new IoUringPipeReader(source.ReadAsync,
+        IoUringMultishotPipeReader reader = new IoUringMultishotPipeReader(source.ReadAsync,
             new PipeOptions(pauseWriterThreshold: 4, resumeWriterThreshold: 2));
         reader.Start();
         TestOwner owner = new TestOwner([1, 2, 3, 4]);
@@ -314,7 +314,7 @@ public class SocketTransportTests : LoggedTestBase
     {
         ReceiveSource source = new ReceiveSource();
         TaskCompletionSource paused = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
-        IoUringPipeReader reader = new IoUringPipeReader(source.ReadAsync,
+        IoUringMultishotPipeReader reader = new IoUringMultishotPipeReader(source.ReadAsync,
             new PipeOptions(pauseWriterThreshold: 4, resumeWriterThreshold: 2),
             onPause: value => { if (value) { paused.TrySetResult(); } });
         reader.Start();
@@ -344,13 +344,13 @@ public class SocketTransportTests : LoggedTestBase
     public async Task MultishotReaderStartFailureAndCompleteBeforeStartDoNotHang()
     {
         IOException failure = new IOException("Start failed");
-        IoUringPipeReader reader = new IoUringPipeReader(_ => throw failure, PipeOptions.Default);
+        IoUringMultishotPipeReader reader = new IoUringMultishotPipeReader(_ => throw failure, PipeOptions.Default);
         Task<ReadResult> pending = reader.ReadAsync().AsTask();
         reader.Start();
         Assert.Same(failure, await Assert.ThrowsAsync<IOException>(() => pending.DefaultTimeout()));
         await reader.CompleteAsync().AsTask().DefaultTimeout();
 
-        reader = new IoUringPipeReader(_ => throw failure, PipeOptions.Default);
+        reader = new IoUringMultishotPipeReader(_ => throw failure, PipeOptions.Default);
         reader.Complete();
         reader.Start();
         await reader.Closed.DefaultTimeout();
@@ -369,7 +369,7 @@ public class SocketTransportTests : LoggedTestBase
         Task connecting = client.ConnectAsync(listener.LocalEndPoint!);
         using Socket server = await listener.AcceptAsync().DefaultTimeout();
         await connecting.DefaultTimeout();
-        IoUringPipeReader reader = new IoUringPipeReader(server, PipeOptions.Default);
+        IoUringMultishotPipeReader reader = new IoUringMultishotPipeReader(server, PipeOptions.Default);
         reader.Start();
         try
         {
@@ -442,7 +442,7 @@ public class SocketTransportTests : LoggedTestBase
             new SocketConnectionFactoryOptions { MaxReadBufferSize = 4 }, NullLogger.Instance);
         ConnectionContext connection = factory.Create(server);
         TestOutputHelper.WriteLine($"Connection implementation: {connection.GetType().Name}");
-        Assert.Equal(IoUringConnection.IsSupported, connection is IoUringConnection);
+        Assert.Equal(IoUringMultishotConnection.IsSupported, connection is IoUringMultishotConnection);
         Assert.Same(server, connection.Features.Get<IConnectionSocketFeature>()!.Socket);
         CancellationToken closed = connection.ConnectionClosed;
         try
@@ -686,7 +686,7 @@ public class SocketTransportTests : LoggedTestBase
     public async Task MultishotReaderRejectsOverlappingReadsAndInvalidAdvances()
     {
         ReceiveSource source = new ReceiveSource();
-        IoUringPipeReader reader = new IoUringPipeReader(source.ReadAsync, PipeOptions.Default);
+        IoUringMultishotPipeReader reader = new IoUringMultishotPipeReader(source.ReadAsync, PipeOptions.Default);
         reader.Start();
         try
         {
@@ -729,7 +729,7 @@ public class SocketTransportTests : LoggedTestBase
         ReceiveSource source = new ReceiveSource();
         using CountingPool pool = new CountingPool(maxBufferSize);
         CountingScheduler scheduler = new CountingScheduler();
-        IoUringPipeReader reader = new IoUringPipeReader(source.ReadAsync,
+        IoUringMultishotPipeReader reader = new IoUringMultishotPipeReader(source.ReadAsync,
             new PipeOptions(pool, scheduler, useSynchronizationContext: false));
         reader.Start();
         try
@@ -761,7 +761,7 @@ public class SocketTransportTests : LoggedTestBase
     public async Task MultishotReaderAbortDoesNotInvalidateActiveRead()
     {
         ReceiveSource source = new ReceiveSource();
-        IoUringPipeReader reader = new IoUringPipeReader(source.ReadAsync, PipeOptions.Default);
+        IoUringMultishotPipeReader reader = new IoUringMultishotPipeReader(source.ReadAsync, PipeOptions.Default);
         reader.Start();
         TestOwner owner = new TestOwner([1, 2, 3]);
         source.Write(owner);
@@ -781,7 +781,7 @@ public class SocketTransportTests : LoggedTestBase
     public async Task MultishotPipeContractAllowsUnexamining(bool explicitExamined)
     {
         ReceiveSource source = new ReceiveSource();
-        IoUringPipeReader reader = new IoUringPipeReader(source.ReadAsync, PipeOptions.Default);
+        IoUringMultishotPipeReader reader = new IoUringMultishotPipeReader(source.ReadAsync, PipeOptions.Default);
         reader.Start();
         try
         {
@@ -821,7 +821,7 @@ public class SocketTransportTests : LoggedTestBase
             source.Write(new TestOwner([1, 2, 3]));
         }
 
-        IoUringPipeReader reader = new IoUringPipeReader(source.ReadAsync, PipeOptions.Default);
+        IoUringMultishotPipeReader reader = new IoUringMultishotPipeReader(source.ReadAsync, PipeOptions.Default);
         reader.Start();
         try
         {
@@ -849,7 +849,7 @@ public class SocketTransportTests : LoggedTestBase
     public async Task MultishotPipeContractPrematureGetResultDoesNotRetirePendingRead()
     {
         ReceiveSource source = new ReceiveSource();
-        IoUringPipeReader reader = new IoUringPipeReader(source.ReadAsync, PipeOptions.Default);
+        IoUringMultishotPipeReader reader = new IoUringMultishotPipeReader(source.ReadAsync, PipeOptions.Default);
         reader.Start();
         ValueTask<ReadResult> pending = reader.ReadAsync();
         try
@@ -871,7 +871,7 @@ public class SocketTransportTests : LoggedTestBase
     public async Task MultishotPipeContractCustomSchedulerPreservesExecutionContext()
     {
         ReceiveSource source = new ReceiveSource();
-        IoUringPipeReader reader = new IoUringPipeReader(source.ReadAsync,
+        IoUringMultishotPipeReader reader = new IoUringMultishotPipeReader(source.ReadAsync,
             new PipeOptions(readerScheduler: new UnsafeScheduler(), useSynchronizationContext: false));
         reader.Start();
         try
@@ -899,7 +899,7 @@ public class SocketTransportTests : LoggedTestBase
     public async Task MultishotPipeContractUsesCapturedSynchronizationContext()
     {
         ReceiveSource source = new ReceiveSource();
-        IoUringPipeReader reader = new IoUringPipeReader(source.ReadAsync, PipeOptions.Default);
+        IoUringMultishotPipeReader reader = new IoUringMultishotPipeReader(source.ReadAsync, PipeOptions.Default);
         reader.Start();
         QueuedSynchronizationContext context = new QueuedSynchronizationContext();
         SynchronizationContext? previous = SynchronizationContext.Current;
@@ -934,7 +934,7 @@ public class SocketTransportTests : LoggedTestBase
     public async Task MultishotPipeContractReadAtLeastCrossesPauseThreshold()
     {
         ReceiveSource source = new ReceiveSource();
-        IoUringPipeReader reader = new IoUringPipeReader(source.ReadAsync,
+        IoUringMultishotPipeReader reader = new IoUringMultishotPipeReader(source.ReadAsync,
             new PipeOptions(pauseWriterThreshold: 4, resumeWriterThreshold: 2));
         reader.Start();
         try
@@ -956,7 +956,7 @@ public class SocketTransportTests : LoggedTestBase
     public async Task MultishotPipeContractInlineCancellationCanReenterReader()
     {
         ReceiveSource source = new ReceiveSource();
-        IoUringPipeReader reader = new IoUringPipeReader(source.ReadAsync,
+        IoUringMultishotPipeReader reader = new IoUringMultishotPipeReader(source.ReadAsync,
             new PipeOptions(readerScheduler: PipeScheduler.Inline, useSynchronizationContext: false));
         reader.Start();
         try
@@ -988,7 +988,7 @@ public class SocketTransportTests : LoggedTestBase
         TaskCompletionSource paused = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         TaskCompletionSource resumed = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         CountingScheduler writerScheduler = new CountingScheduler();
-        IoUringPipeReader reader = new IoUringPipeReader(source.ReadAsync,
+        IoUringMultishotPipeReader reader = new IoUringMultishotPipeReader(source.ReadAsync,
             new PipeOptions(writerScheduler: writerScheduler, pauseWriterThreshold: 4, resumeWriterThreshold: 2),
             onPause: value => (value ? paused : resumed).TrySetResult());
         reader.Start();

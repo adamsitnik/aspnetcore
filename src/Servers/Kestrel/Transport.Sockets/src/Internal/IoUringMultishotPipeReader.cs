@@ -9,9 +9,9 @@ using System.Threading.Tasks.Sources;
 
 namespace Microsoft.AspNetCore.Server.Kestrel.Transport.Sockets.Internal;
 
-// Owns yielded receive buffers until consumption. The runtime owns cancellation,
+// Owns buffers yielded by ReceiveMultishotAsync until consumption. The runtime owns cancellation,
 // native draining, and rearming after provided-buffer exhaustion.
-internal sealed class IoUringPipeReader : PipeReader, IValueTaskSource<ReadResult>
+internal sealed class IoUringMultishotPipeReader : PipeReader, IValueTaskSource<ReadResult>
 {
     private readonly Lock _lock = new();
     private readonly Func<CancellationToken, IAsyncEnumerable<IMemoryOwner<byte>>> _receive;
@@ -24,9 +24,9 @@ internal sealed class IoUringPipeReader : PipeReader, IValueTaskSource<ReadResul
     // ReadCompletion.Publish handles the worker handoff when completion originates elsewhere.
     private ManualResetValueTaskSourceCore<ReadResult> _readSource;
     private CancellationTokenRegistration _readCancellation;
-    private IoUringBufferSegment? _head;
-    private IoUringBufferSegment? _tail;
-    private IoUringBufferSegment? _cachedSegments;
+    private IoUringMultishotBufferSegment? _head;
+    private IoUringMultishotBufferSegment? _tail;
+    private IoUringMultishotBufferSegment? _cachedSegments;
     private int _cachedSegmentCount;
     private int _headOffset;
     private long _written;
@@ -44,14 +44,14 @@ internal sealed class IoUringPipeReader : PipeReader, IValueTaskSource<ReadResul
     private bool _readCanceled;
     private bool _cancelNextRead;
 
-    public IoUringPipeReader(Socket socket, PipeOptions options,
+    public IoUringMultishotPipeReader(Socket socket, PipeOptions options,
         Func<Exception?, Exception?>? onCompleted = null, Action<bool>? onPause = null)
         : this(OperatingSystem.IsLinux() ? socket.ReceiveMultishotAsync : throw new PlatformNotSupportedException(),
             options, onCompleted, onPause)
     {
     }
 
-    internal IoUringPipeReader(Func<CancellationToken, IAsyncEnumerable<IMemoryOwner<byte>>> receive,
+    internal IoUringMultishotPipeReader(Func<CancellationToken, IAsyncEnumerable<IMemoryOwner<byte>>> receive,
         PipeOptions options, Func<Exception?, Exception?>? onCompleted = null, Action<bool>? onPause = null)
     {
         _receive = receive;
@@ -97,17 +97,17 @@ internal sealed class IoUringPipeReader : PipeReader, IValueTaskSource<ReadResul
                         break;
                     }
 
-                    IoUringBufferSegment segment;
+                    IoUringMultishotBufferSegment segment;
                     try
                     {
                         if (_cachedSegments is null)
                         {
-                            segment = new IoUringBufferSegment(owner, _written);
+                            segment = new IoUringMultishotBufferSegment(owner, _written);
                         }
                         else
                         {
                             segment = _cachedSegments;
-                            _cachedSegments = (IoUringBufferSegment?)segment.Next;
+                            _cachedSegments = (IoUringMultishotBufferSegment?)segment.Next;
                             _cachedSegmentCount--;
                             segment.Initialize(owner, _written);
                         }
@@ -211,8 +211,8 @@ internal sealed class IoUringPipeReader : PipeReader, IValueTaskSource<ReadResul
             {
                 _readCancellation = cancellationToken.UnsafeRegister(static state =>
                 {
-                    (IoUringPipeReader reader, short version, CancellationToken token) =
-                        ((IoUringPipeReader, short, CancellationToken))state!;
+                    (IoUringMultishotPipeReader reader, short version, CancellationToken token) =
+                        ((IoUringMultishotPipeReader, short, CancellationToken))state!;
                     reader.CancelRead(version, token);
                 }, (this, version, cancellationToken));
             }
@@ -299,8 +299,8 @@ internal sealed class IoUringPipeReader : PipeReader, IValueTaskSource<ReadResul
             while (_head is not null && consumedLength >= _head.Memory.Length - _headOffset)
             {
                 consumedLength -= _head.Memory.Length - _headOffset;
-                IoUringBufferSegment segment = _head;
-                _head = (IoUringBufferSegment?)segment.Next;
+                IoUringMultishotBufferSegment segment = _head;
+                _head = (IoUringMultishotBufferSegment?)segment.Next;
                 ReturnSegment(segment);
                 _headOffset = 0;
             }
@@ -316,9 +316,9 @@ internal sealed class IoUringPipeReader : PipeReader, IValueTaskSource<ReadResul
                 // A parser may retain an arbitrarily large partial message while requesting
                 // more data. Evacuate examined leases only after the ReadResult is retired;
                 // otherwise it can exhaust the ring's shared pool and never receive the rest.
-                for (IoUringBufferSegment? segment = _head;
+                for (IoUringMultishotBufferSegment? segment = _head;
                     _examined > _consumed && segment is not null && segment.Start < _examined;
-                    segment = (IoUringBufferSegment?)segment.Next)
+                    segment = (IoUringMultishotBufferSegment?)segment.Next)
                 {
                     segment.ReleaseProvidedBuffer(_options.Pool);
                 }
@@ -350,7 +350,7 @@ internal sealed class IoUringPipeReader : PipeReader, IValueTaskSource<ReadResul
         completion.Publish(this);
     }
 
-    private void ReturnSegment(IoUringBufferSegment segment)
+    private void ReturnSegment(IoUringMultishotBufferSegment segment)
     {
         segment.Reset();
         if (_cachedSegmentCount < 16)
@@ -426,8 +426,8 @@ internal sealed class IoUringPipeReader : PipeReader, IValueTaskSource<ReadResul
             completion = CompletePendingRead();
             while (_head is not null)
             {
-                IoUringBufferSegment segment = _head;
-                _head = (IoUringBufferSegment?)segment.Next;
+                IoUringMultishotBufferSegment segment = _head;
+                _head = (IoUringMultishotBufferSegment?)segment.Next;
                 ReturnSegment(segment);
             }
 
@@ -519,7 +519,7 @@ internal sealed class IoUringPipeReader : PipeReader, IValueTaskSource<ReadResul
     {
         private readonly bool _ready = true;
 
-        public void Publish(IoUringPipeReader reader)
+        public void Publish(IoUringMultishotPipeReader reader)
         {
             if (_ready)
             {

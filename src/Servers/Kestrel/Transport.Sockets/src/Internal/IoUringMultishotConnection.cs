@@ -11,12 +11,13 @@ using Microsoft.Extensions.Logging;
 namespace Microsoft.AspNetCore.Server.Kestrel.Transport.Sockets.Internal;
 
 // Receives owned multishot buffers without copying on the common, fully-consumed path.
+// Only receives are multishot; accepts and sends use ordinary socket operations.
 // Output retains SocketConnection's ordinary Pipe and pooled SocketSender fast path.
-internal sealed partial class IoUringConnection : TransportConnection
+internal sealed partial class IoUringMultishotConnection : TransportConnection
 {
     private readonly Socket _socket;
     private readonly ILogger _logger;
-    private readonly IoUringPipeReader _receiveReader;
+    private readonly IoUringMultishotPipeReader _receiveReader;
     private SocketSender? _sender;
     private readonly SocketSenderPool _socketSenderPool;
     private readonly IDuplexPipe _originalTransport;
@@ -34,7 +35,7 @@ internal sealed partial class IoUringConnection : TransportConnection
 
     public static bool IsSupported => System.Threading.IoUring.IsSupported;
 
-    internal IoUringConnection(Socket socket,
+    internal IoUringMultishotConnection(Socket socket,
                               MemoryPool<byte> memoryPool,
                               ILogger logger,
                               SocketSenderPool socketSenderPool,
@@ -57,7 +58,7 @@ internal sealed partial class IoUringConnection : TransportConnection
 
         ConnectionClosed = _connectionClosedTokenSource.Token;
 
-        _receiveReader = new IoUringPipeReader(socket, inputOptions, OnReceiveCompleted, OnReceivePaused);
+        _receiveReader = new IoUringMultishotPipeReader(socket, inputOptions, OnReceiveCompleted, OnReceivePaused);
         if (outputOptions.ReaderScheduler is IOQueue)
         {
             // IOQueue serializes send-loop continuations across connections sharing that queue.
@@ -124,7 +125,7 @@ internal sealed partial class IoUringConnection : TransportConnection
         }
         catch (Exception ex)
         {
-            _logger.LogError(0, ex, $"Unexpected exception in {nameof(IoUringConnection)}.{nameof(DisposeAsync)}.");
+            _logger.LogError(0, ex, $"Unexpected exception in {nameof(IoUringMultishotConnection)}.{nameof(DisposeAsync)}.");
         }
         finally
         {
@@ -336,7 +337,7 @@ internal sealed partial class IoUringConnection : TransportConnection
         }
         catch (Exception ex)
         {
-            _logger.LogError(0, ex, $"Unexpected exception in {nameof(IoUringConnection)}.{nameof(CancelConnectionClosedToken)}.");
+            _logger.LogError(0, ex, $"Unexpected exception in {nameof(IoUringMultishotConnection)}.{nameof(CancelConnectionClosedToken)}.");
         }
     }
 

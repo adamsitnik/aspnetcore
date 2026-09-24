@@ -7,10 +7,10 @@ namespace Microsoft.AspNetCore.Server.Kestrel.Transport.Sockets.Internal;
 
 /// <summary>
 /// One node in the zero-copy <see cref="ReadOnlySequence{Byte}"/> that
-/// <see cref="IoUringPipeReader"/> hands to the application: exactly one completed
+/// <see cref="IoUringMultishotPipeReader"/> hands to the application: exactly one completed
 /// multishot-recv provided-buffer, in arrival order.
 /// </summary>
-internal sealed class IoUringBufferSegment : ReadOnlySequenceSegment<byte>
+internal sealed class IoUringMultishotBufferSegment : ReadOnlySequenceSegment<byte>
 {
     private bool _provided = true;
 
@@ -18,7 +18,7 @@ internal sealed class IoUringBufferSegment : ReadOnlySequenceSegment<byte>
 
     public long Start => RunningIndex;
 
-    public IoUringBufferSegment(IMemoryOwner<byte> owner, long runningIndex)
+    public IoUringMultishotBufferSegment(IMemoryOwner<byte> owner, long runningIndex)
     {
         Initialize(owner, runningIndex);
     }
@@ -32,7 +32,7 @@ internal sealed class IoUringBufferSegment : ReadOnlySequenceSegment<byte>
         Next = null;
     }
 
-    public void SetNext(IoUringBufferSegment? next) => Next = next;
+    public void SetNext(IoUringMultishotBufferSegment? next) => Next = next;
 
     public void Reset()
     {

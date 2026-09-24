@@ -91,9 +91,9 @@ public sealed class SocketConnectionContextFactory : IDisposable
 
         ConnectionContext connection;
 
-        if (IoUringConnection.IsSupported)
+        if (IoUringMultishotConnection.IsSupported)
         {
-            IoUringConnection ioUringConnection = new IoUringConnection(socket,
+            IoUringMultishotConnection ioUringMultishotConnection = new IoUringMultishotConnection(socket,
                 setting.MemoryPool,
                 _logger,
                 setting.SocketSenderPool,
@@ -101,8 +101,8 @@ public sealed class SocketConnectionContextFactory : IDisposable
                 setting.OutputOptions,
                 finOnError: _options.FinOnError);
 
-            ioUringConnection.Start();
-            connection = ioUringConnection;
+            ioUringMultishotConnection.Start();
+            connection = ioUringMultishotConnection;
         }
         else
         {
