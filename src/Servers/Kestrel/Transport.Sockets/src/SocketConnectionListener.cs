@@ -64,22 +64,15 @@ internal sealed class SocketConnectionListener : IConnectionListener
             {
                 Debug.Assert(_listenSocket != null, "Bind must be called first.");
 
-                Socket acceptSocket = await _listenSocket.AcceptAsync(cancellationToken);
-                try
-                {
-                    // Only apply no delay to Tcp based endpoints
-                    if (acceptSocket.LocalEndPoint is IPEndPoint)
-                    {
-                        acceptSocket.NoDelay = _options.NoDelay;
-                    }
+                var acceptSocket = await _listenSocket.AcceptAsync(cancellationToken);
 
-                    return _factory.Create(acceptSocket);
-                }
-                catch
+                // Only apply no delay to Tcp based endpoints
+                if (acceptSocket.LocalEndPoint is IPEndPoint)
                 {
-                    acceptSocket.Dispose();
-                    throw;
+                    acceptSocket.NoDelay = _options.NoDelay;
                 }
+
+                return _factory.Create(acceptSocket);
             }
             catch (ObjectDisposedException)
             {
@@ -110,6 +103,7 @@ internal sealed class SocketConnectionListener : IConnectionListener
         _listenSocket?.Dispose();
 
         _factory.Dispose();
+
         return default;
     }
 }
