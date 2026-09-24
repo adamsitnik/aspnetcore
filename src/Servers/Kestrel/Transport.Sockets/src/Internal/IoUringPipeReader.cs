@@ -250,6 +250,7 @@ internal sealed class IoUringPipeReader : PipeReader, IValueTaskSource<ReadResul
         if (_cancelNextRead || _writerCompleted || _written > _examined)
         {
             _readBuffer = _head is null ? ReadOnlySequence<byte>.Empty :
+                _head == _tail ? new ReadOnlySequence<byte>(_head.Memory[_headOffset..]) :
                 new ReadOnlySequence<byte>(_head, _headOffset, _tail!, _tail!.Memory.Length);
             result = new ReadResult(_readBuffer, _cancelNextRead, _writerCompleted);
             _readCanceled = _cancelNextRead;
@@ -273,8 +274,8 @@ internal sealed class IoUringPipeReader : PipeReader, IValueTaskSource<ReadResul
                 throw new InvalidOperationException("There is no read result to advance.");
             }
 
-            long consumedLength = _readBuffer.Slice(0, consumed).Length;
-            long examinedLength = _readBuffer.Slice(0, examined).Length;
+            long consumedLength = consumed.Equals(_readBuffer.End) ? _readBuffer.Length : _readBuffer.Slice(0, consumed).Length;
+            long examinedLength = examined.Equals(consumed) ? consumedLength : _readBuffer.Slice(0, examined).Length;
             if (consumedLength > examinedLength)
             {
                 throw new InvalidOperationException("The examined position must not precede consumed bytes.");
