@@ -144,17 +144,17 @@ internal sealed partial class IoUringMultishotConnection : TransportConnection
 
         if (error is SocketException socketError && IsConnectionResetError(socketError.SocketErrorCode))
         {
-            SocketsLog.ConnectionReset(_logger, ConnectionId);
+            SocketsLog.ConnectionReset(_logger, this);
             return new ConnectionResetException(socketError.Message, socketError);
         }
 
         if (error is not null)
         {
-            SocketsLog.ConnectionError(_logger, ConnectionId, error);
+            SocketsLog.ConnectionError(_logger, this, error);
         }
         else
         {
-            SocketsLog.ConnectionReadFin(_logger, ConnectionId);
+            SocketsLog.ConnectionReadFin(_logger, this);
         }
 
         return error;
@@ -164,11 +164,11 @@ internal sealed partial class IoUringMultishotConnection : TransportConnection
     {
         if (paused)
         {
-            SocketsLog.ConnectionPause(_logger, ConnectionId);
+            SocketsLog.ConnectionPause(_logger, this);
         }
         else
         {
-            SocketsLog.ConnectionResume(_logger, ConnectionId);
+            SocketsLog.ConnectionResume(_logger, this);
         }
     }
 
@@ -216,7 +216,7 @@ internal sealed partial class IoUringMultishotConnection : TransportConnection
                         {
                             SocketException ex = transferResult.SocketError;
                             shutdownReason = new ConnectionResetException(ex.Message, ex);
-                            SocketsLog.ConnectionReset(_logger, ConnectionId);
+                            SocketsLog.ConnectionReset(_logger, this);
 
                             break;
                         }
@@ -254,7 +254,7 @@ internal sealed partial class IoUringMultishotConnection : TransportConnection
         {
             shutdownReason = ex;
             unexpectedError = ex;
-            SocketsLog.ConnectionError(_logger, ConnectionId, unexpectedError);
+            SocketsLog.ConnectionError(_logger, this, unexpectedError);
         }
         finally
         {
@@ -307,14 +307,14 @@ internal sealed partial class IoUringMultishotConnection : TransportConnection
             // NB: not _shutdownReason since we don't want to do this on graceful completion
             if (!_finOnError && shutdownReason is not null)
             {
-                SocketsLog.ConnectionWriteRst(_logger, ConnectionId, shutdownReason.Message);
+                SocketsLog.ConnectionWriteRst(_logger, this, shutdownReason.Message);
 
                 // This forces an abortive close with linger time 0 (and implies Dispose)
                 _socket.Close(timeout: 0);
                 return;
             }
 
-            SocketsLog.ConnectionWriteFin(_logger, ConnectionId, _shutdownReason.Message);
+            SocketsLog.ConnectionWriteFin(_logger, this, _shutdownReason.Message);
 
             try
             {

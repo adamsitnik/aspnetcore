@@ -7,6 +7,7 @@ using System.IO.Pipelines;
 using System.Net;
 using System.Net.Http;
 using System.Net.Sockets;
+using System.Reflection;
 using System.Runtime.CompilerServices;
 using System.Threading;
 using System.Threading.Channels;
@@ -20,7 +21,9 @@ using Microsoft.AspNetCore.Server.Kestrel.Transport.Sockets;
 using Microsoft.AspNetCore.Server.Kestrel.Transport.Sockets.Internal;
 using Microsoft.AspNetCore.InternalTesting;
 using Microsoft.Extensions.Hosting;
+using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
+using Moq;
 using Xunit;
 using KestrelHttpMethod = Microsoft.AspNetCore.Server.Kestrel.Core.Internal.Http.HttpMethod;
 using KestrelHttpVersion = Microsoft.AspNetCore.Server.Kestrel.Core.Internal.Http.HttpVersion;
@@ -31,6 +34,95 @@ namespace Microsoft.AspNetCore.Server.Kestrel.Sockets.FunctionalTests;
 
 public class SocketTransportTests : LoggedTestBase
 {
+    [Theory]
+    [InlineData(nameof(SocketsLog.ConnectionReadFin), 6, false)]
+    [InlineData(nameof(SocketsLog.ConnectionReadFin), 6, true)]
+    [InlineData(nameof(SocketsLog.ConnectionWriteFin), 7, false)]
+    [InlineData(nameof(SocketsLog.ConnectionWriteFin), 7, true)]
+    [InlineData(nameof(SocketsLog.ConnectionWriteRst), 8, false)]
+    [InlineData(nameof(SocketsLog.ConnectionWriteRst), 8, true)]
+    [InlineData(nameof(SocketsLog.ConnectionError), 14, false)]
+    [InlineData(nameof(SocketsLog.ConnectionError), 14, true)]
+    [InlineData(nameof(SocketsLog.ConnectionReset), 19, false)]
+    [InlineData(nameof(SocketsLog.ConnectionReset), 19, true)]
+    [InlineData(nameof(SocketsLog.ConnectionPause), 4, false)]
+    [InlineData(nameof(SocketsLog.ConnectionPause), 4, true)]
+    [InlineData(nameof(SocketsLog.ConnectionResume), 5, false)]
+    [InlineData(nameof(SocketsLog.ConnectionResume), 5, true)]
+    public async Task SocketLogsOnlyAccessConnectionIdWhenEnabled(string eventName, int eventId, bool enabled)
+    {
+        Mock<ILogger> logger = new Mock<ILogger>();
+        logger.Setup(value => value.IsEnabled(LogLevel.Debug)).Returns(enabled);
+        using Socket socket = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
+        using SocketSenderPool senders = new SocketSenderPool(PipeScheduler.Inline);
+        await using SocketConnection connection = new SocketConnection(socket, MemoryPool<byte>.Shared,
+            PipeScheduler.Inline, logger.Object, senders, PipeOptions.Default, PipeOptions.Default);
+        FieldInfo connectionId = typeof(SocketConnection).BaseType!.GetField("_connectionId", BindingFlags.Instance | BindingFlags.NonPublic)!;
+        Assert.Null(connectionId.GetValue(connection));
+        IOException error = new IOException("Test error");
+
+        switch (eventName)
+        {
+            case nameof(SocketsLog.ConnectionReadFin):
+                SocketsLog.ConnectionReadFin(logger.Object, connection);
+                break;
+            case nameof(SocketsLog.ConnectionWriteFin):
+                SocketsLog.ConnectionWriteFin(logger.Object, connection, "Test shutdown");
+                break;
+            case nameof(SocketsLog.ConnectionWriteRst):
+                SocketsLog.ConnectionWriteRst(logger.Object, connection, "Test shutdown");
+                break;
+            case nameof(SocketsLog.ConnectionError):
+                SocketsLog.ConnectionError(logger.Object, connection, error);
+                break;
+            case nameof(SocketsLog.ConnectionReset):
+                SocketsLog.ConnectionReset(logger.Object, connection);
+                break;
+            case nameof(SocketsLog.ConnectionPause):
+                SocketsLog.ConnectionPause(logger.Object, connection);
+                break;
+            case nameof(SocketsLog.ConnectionResume):
+                SocketsLog.ConnectionResume(logger.Object, connection);
+                break;
+            default:
+                throw new ArgumentOutOfRangeException(nameof(eventName));
+        }
+
+        IEnumerable<Moq.IInvocation> writes = logger.Invocations.Where(value => value.Method.Name == nameof(ILogger.Log));
+        if (!enabled)
+        {
+            Assert.Null(connectionId.GetValue(connection));
+            Assert.Empty(writes);
+            return;
+        }
+
+        Assert.NotNull(connectionId.GetValue(connection));
+        Moq.IInvocation write = Assert.Single(writes);
+        Assert.Equal(LogLevel.Debug, write.Arguments[0]);
+        Assert.Equal(new EventId(eventId, eventName), write.Arguments[1]);
+        Assert.Equal(eventName, ((EventId)write.Arguments[1]).Name);
+        Assert.Same(eventName == nameof(SocketsLog.ConnectionError) ? error : null, write.Arguments[3]);
+        IReadOnlyList<KeyValuePair<string, object?>> state = Assert.IsAssignableFrom<IReadOnlyList<KeyValuePair<string, object?>>>(write.Arguments[2]);
+        Assert.Contains(state, value => value.Key == nameof(ConnectionContext.ConnectionId) && Equals(value.Value, connection.ConnectionId));
+        if (eventName is nameof(SocketsLog.ConnectionWriteFin) or nameof(SocketsLog.ConnectionWriteRst))
+        {
+            Assert.Contains(state, value => value.Key == "Reason" && Equals(value.Value, "Test shutdown"));
+        }
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void SocketResetLogChecksEnabledWithoutConnection(bool enabled)
+    {
+        Mock<ILogger> logger = new Mock<ILogger>();
+        logger.Setup(value => value.IsEnabled(LogLevel.Debug)).Returns(enabled);
+
+        SocketsLog.ConnectionReset(logger.Object, connectionId: "(null)");
+
+        Assert.Equal(enabled ? 1 : 0, logger.Invocations.Count(value => value.Method.Name == nameof(ILogger.Log)));
+    }
+
     [Theory]
     [InlineData(false)]
     [InlineData(true)]
