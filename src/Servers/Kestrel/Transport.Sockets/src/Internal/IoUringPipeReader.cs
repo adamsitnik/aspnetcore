@@ -74,6 +74,7 @@ internal sealed class IoUringPipeReader : PipeReader, IValueTaskSource<ReadResul
         _ = ReceiveAsync();
     }
 
+    [MethodImpl(MethodImplOptions.AggressiveOptimization)]
     private async Task ReceiveAsync()
     {
         Exception? error = null;
