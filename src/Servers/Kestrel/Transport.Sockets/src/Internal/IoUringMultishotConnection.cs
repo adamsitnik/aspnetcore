@@ -12,13 +12,12 @@ namespace Microsoft.AspNetCore.Server.Kestrel.Transport.Sockets.Internal;
 
 // Receives owned multishot buffers without copying on the common, fully-consumed path.
 // Only receives are multishot; accepts and sends use ordinary socket operations.
-// Output uses an ordinary Pipe and a connection-owned SocketSender.
+// Output uses an ordinary Pipe and Socket.SendAsync.
 internal sealed partial class IoUringMultishotConnection : TransportConnection
 {
     private readonly Socket _socket;
     private readonly ILogger _logger;
     private readonly IoUringMultishotPipeReader _receiveReader;
-    private SocketSender? _sender;
     private readonly IDuplexPipe _originalTransport;
     private readonly Pipe _sendPipe;
     private readonly CancellationTokenSource _connectionClosedTokenSource = new();
@@ -124,11 +123,6 @@ internal sealed partial class IoUringMultishotConnection : TransportConnection
         {
             _logger.LogError(0, ex, $"Unexpected exception in {nameof(IoUringMultishotConnection)}.{nameof(DisposeAsync)}.");
         }
-        finally
-        {
-            _sender?.Dispose();
-        }
-
         _connectionClosedTokenSource.Dispose();
     }
 
@@ -189,6 +183,7 @@ internal sealed partial class IoUringMultishotConnection : TransportConnection
     {
         Exception? shutdownReason = null;
         Exception? unexpectedError = null;
+        List<ArraySegment<byte>>? bufferList = null;
 
         try
         {
@@ -204,32 +199,57 @@ internal sealed partial class IoUringMultishotConnection : TransportConnection
 
                 if (!buffer.IsEmpty)
                 {
-                    // Allocate only when needed; the single send loop owns it until DisposeCoreAsync.
-                    _sender ??= new SocketSender(PipeScheduler.Inline);
-                    SocketOperationResult transferResult = await _sender.SendAsync(_socket, buffer);
-
-                    if (transferResult.HasError)
+                    try
                     {
-                        if (IsConnectionResetError(transferResult.SocketError.SocketErrorCode))
+                        // Match SocketConnection's batch boundary even when io_uring completes a partial send.
+                        ReadOnlySequence<byte> remaining = buffer;
+                        while (!remaining.IsEmpty)
                         {
-                            SocketException ex = transferResult.SocketError;
+                            int bytesTransferred;
+                            if (remaining.IsSingleSegment)
+                            {
+                                bytesTransferred = await _socket.SendAsync(remaining.First, SocketFlags.None);
+                            }
+                            else
+                            {
+                                bufferList ??= new List<ArraySegment<byte>>();
+                                foreach (ReadOnlyMemory<byte> segment in remaining)
+                                {
+                                    bufferList.Add(segment.GetArray());
+                                }
+
+                                try
+                                {
+                                    bytesTransferred = await _socket.SendAsync(bufferList, SocketFlags.None);
+                                }
+                                finally
+                                {
+                                    bufferList.Clear();
+                                }
+                            }
+
+                            remaining = remaining.Slice(bytesTransferred);
+                        }
+                    }
+                    catch (SocketException ex)
+                    {
+                        if (IsConnectionResetError(ex.SocketErrorCode))
+                        {
                             shutdownReason = new ConnectionResetException(ex.Message, ex);
                             SocketsLog.ConnectionReset(_logger, this);
 
                             break;
                         }
 
-                        if (IsConnectionAbortError(transferResult.SocketError.SocketErrorCode))
+                        if (IsConnectionAbortError(ex.SocketErrorCode))
                         {
-                            shutdownReason = transferResult.SocketError;
+                            shutdownReason = ex;
 
                             break;
                         }
 
-                        unexpectedError = shutdownReason = transferResult.SocketError;
+                        unexpectedError = shutdownReason = ex;
                     }
-
-                    _sender.Reset();
                 }
 
                 Output.AdvanceTo(buffer.End);

@@ -608,9 +608,11 @@ public class SocketTransportTests : LoggedTestBase
     }
 
     [Theory]
-    [InlineData(false)]
-    [InlineData(true)]
-    public async Task MultishotConnectionReusesSenderAndClearsSentBuffer(bool abort)
+    [InlineData(false, false)]
+    [InlineData(false, true)]
+    [InlineData(true, false)]
+    [InlineData(true, true)]
+    public async Task MultishotConnectionSendsSingleAndMultipleBuffers(bool abort, bool multipleBuffers)
     {
         if (!IoUringMultishotConnection.IsSupported)
         {
@@ -627,12 +629,10 @@ public class SocketTransportTests : LoggedTestBase
         using SocketConnectionContextFactory factory = new(
             new SocketConnectionFactoryOptions { MaxWriteBufferSize = 2 }, NullLogger.Instance);
         await using ConnectionContext connection = factory.Create(server);
-        FieldInfo senderField = typeof(IoUringMultishotConnection).GetField("_sender", BindingFlags.Instance | BindingFlags.NonPublic)!;
-        Assert.Null(senderField.GetValue(connection));
-        SocketSender? sender = null;
-        for (int iteration = 0; iteration < 3; iteration++)
+        for (int iteration = 0; iteration < 5; iteration++)
         {
-            byte[] payload = new byte[iteration == 1 ? 8192 : 128];
+            bool scatterGather = multipleBuffers && iteration is 2 or 4;
+            byte[] payload = new byte[scatterGather ? 8192 : 128];
             Array.Fill(payload, (byte)iteration);
             int written = 0;
             while (written < payload.Length)
@@ -655,20 +655,6 @@ public class SocketTransportTests : LoggedTestBase
             }
 
             Assert.Equal(payload, received);
-            SocketSender current = Assert.IsType<SocketSender>(senderField.GetValue(connection));
-            if (sender is not null)
-            {
-                Assert.Same(sender, current);
-            }
-
-            sender = current;
-            Assert.True(sender.MemoryBuffer.IsEmpty);
-            Assert.Null(sender.BufferList);
-            if (iteration == 1)
-            {
-                FieldInfo bufferListField = typeof(SocketSender).GetField("_bufferList", BindingFlags.Instance | BindingFlags.NonPublic)!;
-                Assert.Empty(Assert.IsType<List<ArraySegment<byte>>>(bufferListField.GetValue(sender)));
-            }
         }
 
         if (abort)
@@ -678,6 +664,96 @@ public class SocketTransportTests : LoggedTestBase
 
         await connection.DisposeAsync().AsTask().DefaultTimeout();
         Assert.True(server.SafeHandle.IsClosed);
+    }
+
+    [Theory]
+    [InlineData(false, false)]
+    [InlineData(true, false)]
+    [InlineData(false, true)]
+    public async Task MultishotConnectionDrainsOutputBeforeAdvancing(bool abort, bool completeOutput)
+    {
+        if (!IoUringMultishotConnection.IsSupported)
+        {
+            return;
+        }
+
+        const int PayloadLength = 2 * 1024 * 1024;
+        using Socket listener = new(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
+        listener.Bind(new IPEndPoint(IPAddress.Loopback, 0));
+        listener.Listen(1);
+        using Socket client = new(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
+        client.ReceiveBufferSize = 4096;
+        Task connecting = client.ConnectAsync(listener.LocalEndPoint!);
+        using Socket server = await listener.AcceptAsync().DefaultTimeout();
+        await connecting.DefaultTimeout();
+        server.SendBufferSize = 4096;
+        using CountingPool pool = new();
+        await using IoUringMultishotConnection connection = new(server, pool, NullLogger.Instance,
+            new PipeOptions(useSynchronizationContext: false),
+            new PipeOptions(pool, pauseWriterThreshold: PayloadLength, resumeWriterThreshold: PayloadLength / 2,
+                useSynchronizationContext: false));
+        byte[] payload = new byte[PayloadLength];
+        for (int index = 0; index < payload.Length; index++)
+        {
+            payload[index] = (byte)(index % 251);
+        }
+
+        PipeWriter output = connection.Transport.Output;
+        payload.CopyTo(output.GetMemory(payload.Length));
+        output.Advance(payload.Length);
+        Task<FlushResult> flush = output.FlushAsync().AsTask();
+        if (completeOutput)
+        {
+            output.Complete();
+        }
+        connection.Start();
+
+        byte[] received = new byte[payload.Length];
+        int prefixLength = payload.Length * 3 / 4;
+        try
+        {
+            // Blocking receives keep the client independent of the experimental async receive path.
+            await Task.Factory.StartNew(() => Receive(0, prefixLength), CancellationToken.None,
+                TaskCreationOptions.LongRunning, TaskScheduler.Default).DefaultTimeout();
+
+            FieldInfo pipeField = typeof(IoUringMultishotConnection).GetField("_sendPipe", BindingFlags.Instance | BindingFlags.NonPublic)!;
+            Pipe pipe = Assert.IsType<Pipe>(pipeField.GetValue(connection));
+            PropertyInfo lengthProperty = typeof(Pipe).GetProperty("Length", BindingFlags.Instance | BindingFlags.NonPublic)!;
+            Assert.Equal((long)payload.Length, Assert.IsType<long>(lengthProperty.GetValue(pipe)));
+            if (!completeOutput)
+            {
+                Assert.False(flush.IsCompleted);
+            }
+
+            if (abort)
+            {
+                connection.Abort(new ConnectionAbortedException("Test output abort"));
+            }
+            else
+            {
+                await Task.Factory.StartNew(() => Receive(prefixLength, payload.Length), CancellationToken.None,
+                    TaskCreationOptions.LongRunning, TaskScheduler.Default).DefaultTimeout();
+                Assert.Equal(payload, received);
+            }
+
+            await flush.DefaultTimeout();
+        }
+        finally
+        {
+            connection.Abort(new ConnectionAbortedException("Test cleanup"));
+            client.Dispose();
+            await connection.DisposeAsync().AsTask().DefaultTimeout();
+        }
+
+        void Receive(int offset, int end)
+        {
+            while (offset < end)
+            {
+                int count = client.Receive(received.AsSpan(offset, end - offset));
+                Assert.True(count > 0);
+                offset += count;
+            }
+        }
     }
 
     [Theory]
