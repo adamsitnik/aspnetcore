@@ -2,6 +2,7 @@
 // The .NET Foundation licenses this file to you under the MIT license.
 
 using System.Buffers;
+using System.Diagnostics;
 using System.IO.Pipelines;
 using System.Net.Sockets;
 using Microsoft.AspNetCore.Connections;
@@ -55,7 +56,7 @@ public sealed class SocketConnectionContextFactory : IDisposable
                     Scheduler = transportScheduler,
                     InputOptions = new PipeOptions(memoryPool, applicationScheduler, transportScheduler, maxReadBufferSize, maxReadBufferSize / 2, useSynchronizationContext: false),
                     OutputOptions = new PipeOptions(memoryPool, transportScheduler, applicationScheduler, maxWriteBufferSize, maxWriteBufferSize / 2, useSynchronizationContext: false),
-                    SocketSenderPool = new SocketSenderPool(PipeScheduler.Inline),
+                    SocketSenderPool = IoUringMultishotConnection.IsSupported ? null : new SocketSenderPool(PipeScheduler.Inline),
                     MemoryPool = memoryPool,
                 };
             }
@@ -72,7 +73,7 @@ public sealed class SocketConnectionContextFactory : IDisposable
                     Scheduler = transportScheduler,
                     InputOptions = new PipeOptions(memoryPool, applicationScheduler, transportScheduler, maxReadBufferSize, maxReadBufferSize / 2, useSynchronizationContext: false),
                     OutputOptions = new PipeOptions(memoryPool, transportScheduler, applicationScheduler, maxWriteBufferSize, maxWriteBufferSize / 2, useSynchronizationContext: false),
-                    SocketSenderPool = new SocketSenderPool(PipeScheduler.Inline),
+                    SocketSenderPool = IoUringMultishotConnection.IsSupported ? null : new SocketSenderPool(PipeScheduler.Inline),
                     MemoryPool = memoryPool,
                 }
             ];
@@ -96,7 +97,6 @@ public sealed class SocketConnectionContextFactory : IDisposable
             IoUringMultishotConnection ioUringMultishotConnection = new(socket,
                 setting.MemoryPool,
                 _logger,
-                setting.SocketSenderPool,
                 setting.InputOptions,
                 setting.OutputOptions,
                 finOnError: _options.FinOnError);
@@ -106,6 +106,7 @@ public sealed class SocketConnectionContextFactory : IDisposable
         }
         else
         {
+            Debug.Assert(setting.SocketSenderPool is not null);
             SocketConnection socketConnection = new SocketConnection(socket,
                 setting.MemoryPool,
                 setting.SocketSenderPool.Scheduler,
@@ -129,7 +130,7 @@ public sealed class SocketConnectionContextFactory : IDisposable
         // Dispose any pooled senders and memory pools
         foreach (var setting in _settings)
         {
-            setting.SocketSenderPool.Dispose();
+            setting.SocketSenderPool?.Dispose();
             setting.MemoryPool.Dispose();
         }
     }
@@ -139,7 +140,7 @@ public sealed class SocketConnectionContextFactory : IDisposable
         public PipeScheduler Scheduler { get; init; } = default!;
         public PipeOptions InputOptions { get; init; } = default!;
         public PipeOptions OutputOptions { get; init; } = default!;
-        public SocketSenderPool SocketSenderPool { get; init; } = default!;
+        public SocketSenderPool? SocketSenderPool { get; init; }
         public MemoryPool<byte> MemoryPool { get; init; } = default!;
     }
 }

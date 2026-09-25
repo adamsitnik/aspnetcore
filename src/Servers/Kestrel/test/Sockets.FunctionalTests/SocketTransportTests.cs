@@ -608,6 +608,103 @@ public class SocketTransportTests : LoggedTestBase
     }
 
     [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task MultishotConnectionReusesSenderAndClearsSentBuffer(bool abort)
+    {
+        if (!IoUringMultishotConnection.IsSupported)
+        {
+            return;
+        }
+
+        using Socket listener = new(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
+        listener.Bind(new IPEndPoint(IPAddress.Loopback, 0));
+        listener.Listen(1);
+        using Socket client = new(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
+        Task connecting = client.ConnectAsync(listener.LocalEndPoint!);
+        using Socket server = await listener.AcceptAsync().DefaultTimeout();
+        await connecting.DefaultTimeout();
+        using SocketConnectionContextFactory factory = new(
+            new SocketConnectionFactoryOptions { MaxWriteBufferSize = 2 }, NullLogger.Instance);
+        await using ConnectionContext connection = factory.Create(server);
+        FieldInfo senderField = typeof(IoUringMultishotConnection).GetField("_sender", BindingFlags.Instance | BindingFlags.NonPublic)!;
+        Assert.Null(senderField.GetValue(connection));
+        SocketSender? sender = null;
+        for (int iteration = 0; iteration < 3; iteration++)
+        {
+            byte[] payload = new byte[iteration == 1 ? 8192 : 128];
+            Array.Fill(payload, (byte)iteration);
+            int written = 0;
+            while (written < payload.Length)
+            {
+                Memory<byte> memory = connection.Transport.Output.GetMemory(1);
+                int length = Math.Min(memory.Length, payload.Length - written);
+                payload.AsMemory(written, length).CopyTo(memory);
+                connection.Transport.Output.Advance(length);
+                written += length;
+            }
+
+            await connection.Transport.Output.FlushAsync().AsTask().DefaultTimeout();
+            byte[] received = new byte[payload.Length];
+            int count = 0;
+            while (count < received.Length)
+            {
+                int read = await client.ReceiveAsync(received.AsMemory(count), SocketFlags.None).DefaultTimeout();
+                Assert.True(read > 0);
+                count += read;
+            }
+
+            Assert.Equal(payload, received);
+            SocketSender current = Assert.IsType<SocketSender>(senderField.GetValue(connection));
+            if (sender is not null)
+            {
+                Assert.Same(sender, current);
+            }
+
+            sender = current;
+            Assert.True(sender.MemoryBuffer.IsEmpty);
+            Assert.Null(sender.BufferList);
+            if (iteration == 1)
+            {
+                FieldInfo bufferListField = typeof(SocketSender).GetField("_bufferList", BindingFlags.Instance | BindingFlags.NonPublic)!;
+                Assert.Empty(Assert.IsType<List<ArraySegment<byte>>>(bufferListField.GetValue(sender)));
+            }
+        }
+
+        if (abort)
+        {
+            connection.Abort(new ConnectionAbortedException("Test sender cleanup"));
+        }
+
+        await connection.DisposeAsync().AsTask().DefaultTimeout();
+        Assert.True(server.SafeHandle.IsClosed);
+    }
+
+    [Theory]
+    [InlineData(0)]
+    [InlineData(2)]
+    public void MultishotFactoryDoesNotCreateSenderPools(int ioQueueCount)
+    {
+        using SocketConnectionContextFactory factory = new(
+            new SocketConnectionFactoryOptions { IOQueueCount = ioQueueCount }, NullLogger.Instance);
+        FieldInfo settingsField = typeof(SocketConnectionContextFactory).GetField("_settings", BindingFlags.Instance | BindingFlags.NonPublic)!;
+        Array settings = Assert.IsAssignableFrom<Array>(settingsField.GetValue(factory));
+        Assert.Equal(Math.Max(1, ioQueueCount), settings.Length);
+        foreach (object setting in settings)
+        {
+            object? pool = setting.GetType().GetProperty("SocketSenderPool")!.GetValue(setting);
+            if (IoUringMultishotConnection.IsSupported)
+            {
+                Assert.Null(pool);
+            }
+            else
+            {
+                Assert.IsType<SocketSenderPool>(pool);
+            }
+        }
+    }
+
+    [Theory]
     [InlineData(false, false, true)]
     [InlineData(true, false, true)]
     [InlineData(false, true, true)]

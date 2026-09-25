@@ -12,14 +12,13 @@ namespace Microsoft.AspNetCore.Server.Kestrel.Transport.Sockets.Internal;
 
 // Receives owned multishot buffers without copying on the common, fully-consumed path.
 // Only receives are multishot; accepts and sends use ordinary socket operations.
-// Output retains SocketConnection's ordinary Pipe and pooled SocketSender fast path.
+// Output uses an ordinary Pipe and a connection-owned SocketSender.
 internal sealed partial class IoUringMultishotConnection : TransportConnection
 {
     private readonly Socket _socket;
     private readonly ILogger _logger;
     private readonly IoUringMultishotPipeReader _receiveReader;
     private SocketSender? _sender;
-    private readonly SocketSenderPool _socketSenderPool;
     private readonly IDuplexPipe _originalTransport;
     private readonly Pipe _sendPipe;
     private readonly CancellationTokenSource _connectionClosedTokenSource = new();
@@ -38,7 +37,6 @@ internal sealed partial class IoUringMultishotConnection : TransportConnection
     internal IoUringMultishotConnection(Socket socket,
                               MemoryPool<byte> memoryPool,
                               ILogger logger,
-                              SocketSenderPool socketSenderPool,
                               PipeOptions inputOptions,
                               PipeOptions outputOptions,
                               bool finOnError = false)
@@ -50,7 +48,6 @@ internal sealed partial class IoUringMultishotConnection : TransportConnection
         _socket = socket;
         MemoryPool = memoryPool;
         _logger = logger;
-        _socketSenderPool = socketSenderPool;
         _finOnError = finOnError;
 
         LocalEndPoint = _socket.LocalEndPoint;
@@ -207,7 +204,8 @@ internal sealed partial class IoUringMultishotConnection : TransportConnection
 
                 if (!buffer.IsEmpty)
                 {
-                    _sender = _socketSenderPool.Rent();
+                    // Allocate only when needed; the single send loop owns it until DisposeCoreAsync.
+                    _sender ??= new SocketSender(PipeScheduler.Inline);
                     SocketOperationResult transferResult = await _sender.SendAsync(_socket, buffer);
 
                     if (transferResult.HasError)
@@ -231,10 +229,7 @@ internal sealed partial class IoUringMultishotConnection : TransportConnection
                         unexpectedError = shutdownReason = transferResult.SocketError;
                     }
 
-                    // We don't return to the pool if there was an exception, and
-                    // we keep the _sender assigned so that we can dispose it in DisposeAsync.
-                    _socketSenderPool.Return(_sender);
-                    _sender = null;
+                    _sender.Reset();
                 }
 
                 Output.AdvanceTo(buffer.End);
