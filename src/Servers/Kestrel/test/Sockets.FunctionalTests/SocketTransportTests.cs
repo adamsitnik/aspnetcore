@@ -16,6 +16,7 @@ using Microsoft.AspNetCore.Builder;
 using Microsoft.AspNetCore.Connections;
 using Microsoft.AspNetCore.Connections.Features;
 using Microsoft.AspNetCore.Hosting;
+using Microsoft.AspNetCore.Http;
 using Microsoft.AspNetCore.Server.Kestrel.FunctionalTests;
 using Microsoft.AspNetCore.Server.Kestrel.Transport.Sockets;
 using Microsoft.AspNetCore.Server.Kestrel.Transport.Sockets.Internal;
@@ -34,6 +35,324 @@ namespace Microsoft.AspNetCore.Server.Kestrel.Sockets.FunctionalTests;
 
 public class SocketTransportTests : LoggedTestBase
 {
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task PairedTransportDefersReadUntilPendingSendFinishes(bool reset)
+    {
+        if (!System.Threading.IoUring.IsSupported)
+        {
+            return;
+        }
+        using Socket listener = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
+        listener.Bind(new IPEndPoint(IPAddress.Loopback, 0));
+        listener.Listen(1);
+        using Socket client = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
+        client.ReceiveBufferSize = 1024;
+        client.ReceiveTimeout = 3000;
+        client.Connect(listener.LocalEndPoint!);
+        using Socket server = listener.Accept();
+        server.SendBufferSize = 1024;
+        server.Blocking = false;
+        await using IoUringPairedConnection connection = new IoUringPairedConnection(server, MemoryPool<byte>.Shared, NullLogger.Instance);
+        Task<ReadResult> first = connection.Transport.Input.ReadAsync().AsTask();
+        Assert.Equal(1, client.Send(new byte[] { 1 }));
+        ReadResult input = await first.DefaultTimeout();
+        connection.Transport.Input.AdvanceTo(input.Buffer.End);
+
+        byte[] padding = new byte[64 * 1024];
+        int primed = 0;
+        try
+        {
+            while (true)
+            {
+                primed += server.Send(padding);
+            }
+        }
+        catch (SocketException exception) when (exception.SocketErrorCode == SocketError.WouldBlock)
+        {
+        }
+
+        connection.Transport.Output.GetSpan(IoUringPairedConnection.BufferSize)[..IoUringPairedConnection.BufferSize].Fill(42);
+        connection.Transport.Output.Advance(IoUringPairedConnection.BufferSize);
+        await connection.Transport.Output.FlushAsync();
+        Task<ReadResult> next = connection.Transport.Input.ReadAsync().AsTask();
+        Type type = typeof(IoUringPairedConnection);
+        System.Threading.IoUringOperation send = (System.Threading.IoUringOperation)type.GetField("_send", BindingFlags.NonPublic | BindingFlags.Instance)!.GetValue(connection)!;
+        System.Threading.IoUringOperation receive = (System.Threading.IoUringOperation)type.GetField("_receive", BindingFlags.NonPublic | BindingFlags.Instance)!.GetValue(connection)!;
+        Assert.True(send.IsPending);
+        Assert.Equal(1, client.Send(new byte[] { 2 }));
+        Assert.True(SpinWait.SpinUntil(() => !receive.IsPending, TimeSpan.FromSeconds(10)));
+        Assert.True(send.IsPending);
+        Assert.False(next.IsCompleted);
+
+        if (reset)
+        {
+            client.LingerState = new LingerOption(true, 0);
+            client.Dispose();
+            await Assert.ThrowsAsync<ConnectionResetException>(() => next).DefaultTimeout();
+            return;
+        }
+
+        Task drain = Task.Run(() =>
+        {
+            byte[] response = new byte[primed + IoUringPairedConnection.BufferSize];
+            int count = 0;
+            while (count < response.Length)
+            {
+                int received = client.Receive(response.AsSpan(count));
+                Assert.True(received > 0);
+                count += received;
+            }
+            Assert.All(response.AsSpan(primed).ToArray(), value => Assert.Equal(42, value));
+        });
+        input = await next.DefaultTimeout();
+        Assert.False(send.IsPending);
+        Assert.False(connection.Transport.Output.GetMemory(1).IsEmpty);
+        await drain.DefaultTimeout();
+        Assert.Equal(new byte[] { 2 }, input.Buffer.ToArray());
+        connection.Transport.Input.AdvanceTo(input.Buffer.End);
+    }
+
+    [Fact]
+    public async Task PairedTransportDisposeDoesNotBlockReadCancellation()
+    {
+        if (!System.Threading.IoUring.IsSupported)
+        {
+            return;
+        }
+        using Socket listener = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
+        listener.Bind(new IPEndPoint(IPAddress.Loopback, 0));
+        listener.Listen(1);
+        using Socket client = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
+        client.Connect(listener.LocalEndPoint!);
+        using Socket server = listener.Accept();
+        await using IoUringPairedConnection connection = new IoUringPairedConnection(server, MemoryPool<byte>.Shared, NullLogger.Instance);
+        using CancellationTokenSource cancellation = new CancellationTokenSource();
+        ValueTask<ReadResult> pending = connection.Transport.Input.ReadAsync(cancellation.Token);
+        using ManualResetEventSlim cancellationStarted = new ManualResetEventSlim();
+        using CancellationTokenRegistration marker = cancellation.Token.Register(cancellationStarted.Set);
+        Type type = typeof(IoUringPairedConnection);
+        Lock gate = (Lock)type.GetField("_sync", BindingFlags.NonPublic | BindingFlags.Instance)!.GetValue(connection)!;
+        System.Threading.IoUringOperation operation = (System.Threading.IoUringOperation)type.GetField("_receive", BindingFlags.NonPublic | BindingFlags.Instance)!.GetValue(connection)!;
+        Thread cancellationThread = new Thread(cancellation.Cancel) { IsBackground = true };
+        Task disposal;
+        lock (gate)
+        {
+            Assert.Equal(1, client.Send(new byte[] { 1 }));
+            Assert.True(SpinWait.SpinUntil(() => !operation.IsPending, TimeSpan.FromSeconds(10)));
+            cancellationThread.Start();
+            Assert.True(cancellationStarted.Wait(TimeSpan.FromSeconds(10)));
+            Assert.True(SpinWait.SpinUntil(
+                () => (cancellationThread.ThreadState & System.Threading.ThreadState.WaitSleepJoin) != 0,
+                TimeSpan.FromSeconds(10)));
+            disposal = connection.DisposeAsync().AsTask();
+        }
+        Assert.True(cancellationThread.Join(TimeSpan.FromSeconds(10)));
+        await disposal.DefaultTimeout();
+        Assert.True((await pending).IsCompleted);
+    }
+
+    [Fact]
+    public async Task PairedTransportDoesNotReuseReceiveBeforeWorkerDelivery()
+    {
+        if (!System.Threading.IoUring.IsSupported)
+        {
+            return;
+        }
+        using Socket listener = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
+        listener.Bind(new IPEndPoint(IPAddress.Loopback, 0));
+        listener.Listen(1);
+        using Socket client = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
+        client.Connect(listener.LocalEndPoint!);
+        using Socket server = listener.Accept();
+        await using IoUringPairedConnection connection = new IoUringPairedConnection(server, MemoryPool<byte>.Shared, NullLogger.Instance);
+        Task<ReadResult> first = connection.Transport.Input.ReadAsync().AsTask();
+        Assert.Equal(1, client.Send(new byte[] { 1 }));
+        ReadResult result = await first.DefaultTimeout();
+        connection.Transport.Input.AdvanceTo(result.Buffer.End);
+        connection.Transport.Output.GetSpan(1)[0] = 2;
+        connection.Transport.Output.Advance(1);
+        await connection.Transport.Output.FlushAsync();
+        Assert.Equal(1, client.Receive(new byte[1]));
+
+        Type type = typeof(IoUringPairedConnection);
+        Lock gate = (Lock)type.GetField("_sync", BindingFlags.NonPublic | BindingFlags.Instance)!.GetValue(connection)!;
+        System.Threading.IoUringOperation operation = (System.Threading.IoUringOperation)type.GetField("_receive", BindingFlags.NonPublic | BindingFlags.Instance)!.GetValue(connection)!;
+        Task<ReadResult> second;
+        lock (gate)
+        {
+            // Real native completion can proceed, but its worker cannot publish input while this gate is held.
+            Assert.Equal(1, client.Send(new byte[] { 3 }));
+            Assert.True(SpinWait.SpinUntil(() => !operation.IsPending, TimeSpan.FromSeconds(10)));
+            second = connection.Transport.Input.ReadAsync().AsTask();
+            Assert.False(operation.IsPending);
+        }
+        result = await second.DefaultTimeout();
+        Assert.Equal(new byte[] { 3 }, result.Buffer.ToArray());
+        connection.Transport.Input.AdvanceTo(result.Buffer.End);
+        connection.Transport.Output.GetSpan(1)[0] = 4;
+        connection.Transport.Output.Advance(1);
+        await connection.Transport.Output.FlushAsync();
+        byte[] response = new byte[1];
+        Assert.Equal(1, client.Receive(response));
+        Assert.Equal(4, response[0]);
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task PairedTransportCompletesFinalOutput(bool completeInputFirst)
+    {
+        if (!System.Threading.IoUring.IsSupported)
+        {
+            return;
+        }
+        using Socket listener = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
+        listener.Bind(new IPEndPoint(IPAddress.Loopback, 0));
+        listener.Listen(1);
+        using Socket client = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
+        client.ReceiveTimeout = 10000;
+        client.Connect(listener.LocalEndPoint!);
+        using Socket server = listener.Accept();
+        await using IoUringPairedConnection connection = new IoUringPairedConnection(server, MemoryPool<byte>.Shared, NullLogger.Instance);
+        Task<ReadResult> pending = connection.Transport.Input.ReadAsync().AsTask();
+        Assert.Equal(1, client.Send(new byte[] { 42 }));
+        ReadResult result = await pending.DefaultTimeout();
+        connection.Transport.Output.GetSpan(1)[0] = 43;
+        connection.Transport.Output.Advance(1);
+        await connection.Transport.Output.FlushAsync();
+        if (completeInputFirst)
+        {
+            connection.Transport.Input.Complete();
+        }
+        await connection.Transport.Output.CompleteAsync().AsTask().DefaultTimeout();
+        byte[] response = new byte[1];
+        Assert.Equal(1, client.Receive(response));
+        Assert.Equal(43, response[0]);
+        connection.Transport.Input.AdvanceTo(result.Buffer.End);
+    }
+
+    [Fact]
+    public async Task PairedTransportHostedJson()
+    {
+        IHostBuilder builder = TransportSelector.GetHostBuilder().ConfigureWebHost(web =>
+            web.UseKestrel().UseUrls("http://127.0.0.1:0").Configure(app =>
+                app.Run(context =>
+                {
+                    context.Response.ContentType = "application/json";
+                    context.Response.ContentLength = "{\"message\":\"Hello, World!\"}"u8.Length;
+                    return context.Response.WriteAsync("{\"message\":\"Hello, World!\"}");
+                })));
+        using IHost host = builder.Build();
+        await host.StartAsync().DefaultTimeout();
+        try
+        {
+            using HttpClient client = new HttpClient();
+            for (int index = 0; index < 100; index++)
+            {
+                string response = await client.GetStringAsync($"http://127.0.0.1:{host.GetPort()}/json").DefaultTimeout();
+                Assert.Equal("{\"message\":\"Hello, World!\"}", response);
+            }
+        }
+        finally
+        {
+            await host.StopAsync().DefaultTimeout();
+        }
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task PairedTransportPreservesFragmentedRequests(bool fragmented)
+    {
+        if (!System.Threading.IoUring.IsSupported)
+        {
+            return;
+        }
+        using Socket listener = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
+        listener.Bind(new IPEndPoint(IPAddress.Loopback, 0));
+        listener.Listen(1);
+        using Socket client = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
+        client.Connect(listener.LocalEndPoint!);
+        using Socket server = listener.Accept();
+        await using IoUringPairedConnection connection = new IoUringPairedConnection(server, MemoryPool<byte>.Shared, NullLogger.Instance);
+        byte[] request = [1, 2, 3, 4];
+        byte[] reply = new byte[4];
+        for (int iteration = 0; iteration < 20; iteration++)
+        {
+            Task<ReadResult> pending = connection.Transport.Input.ReadAsync().AsTask();
+            Assert.Equal(fragmented ? 2 : 4, client.Send(request.AsSpan(0, fragmented ? 2 : 4)));
+            ReadResult result = await pending.DefaultTimeout();
+            if (fragmented)
+            {
+                Assert.Equal(2, result.Buffer.Length);
+                connection.Transport.Input.AdvanceTo(result.Buffer.Start, result.Buffer.End);
+                pending = connection.Transport.Input.ReadAsync().AsTask();
+                Assert.Equal(2, client.Send(request.AsSpan(2)));
+                result = await pending.DefaultTimeout();
+            }
+            Assert.Equal(request, result.Buffer.ToArray());
+            connection.Transport.Input.AdvanceTo(result.Buffer.End);
+            request.CopyTo(connection.Transport.Output.GetMemory(request.Length));
+            connection.Transport.Output.Advance(request.Length);
+            await connection.Transport.Output.FlushAsync();
+            int received = 0;
+            while (received < reply.Length)
+            {
+                int count = client.Receive(reply.AsSpan(received));
+                Assert.True(count > 0);
+                received += count;
+            }
+            Assert.Equal(request, reply);
+        }
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task PairedTransportRejectsOverflowAndDrainsCancellation(bool input)
+    {
+        if (!System.Threading.IoUring.IsSupported)
+        {
+            return;
+        }
+        using Socket listener = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
+        listener.Bind(new IPEndPoint(IPAddress.Loopback, 0));
+        listener.Listen(1);
+        using Socket client = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
+        client.Connect(listener.LocalEndPoint!);
+        using Socket server = listener.Accept();
+        await using IoUringPairedConnection connection = new IoUringPairedConnection(server, MemoryPool<byte>.Shared, NullLogger.Instance);
+        if (input)
+        {
+            Task<ReadResult> pending = connection.Transport.Input.ReadAsync().AsTask();
+            byte[] payload = new byte[IoUringPairedConnection.BufferSize];
+            Assert.Equal(payload.Length, client.Send(payload));
+            while (true)
+            {
+                ReadResult result = await pending.DefaultTimeout();
+                connection.Transport.Input.AdvanceTo(result.Buffer.Start, result.Buffer.End);
+                if (result.Buffer.Length == payload.Length)
+                {
+                    break;
+                }
+                pending = connection.Transport.Input.ReadAsync().AsTask();
+            }
+            Assert.Throws<InvalidOperationException>(() => connection.Transport.Input.ReadAsync());
+        }
+        else
+        {
+            Assert.Equal(IoUringPairedConnection.BufferSize, connection.Transport.Output.GetMemory(IoUringPairedConnection.BufferSize).Length);
+            Assert.Throws<InvalidOperationException>(() => connection.Transport.Output.GetMemory(IoUringPairedConnection.BufferSize + 1));
+            Task<ReadResult> pending = connection.Transport.Input.ReadAsync().AsTask();
+            connection.Abort(new ConnectionAbortedException("Test cancellation"));
+            await Assert.ThrowsAsync<ConnectionAbortedException>(() => pending);
+        }
+        await connection.DisposeAsync().AsTask().DefaultTimeout();
+        Assert.True(server.SafeHandle.IsClosed);
+    }
+
     [Theory]
     [InlineData(nameof(SocketsLog.ConnectionReadFin), 6, false)]
     [InlineData(nameof(SocketsLog.ConnectionReadFin), 6, true)]
@@ -534,7 +853,7 @@ public class SocketTransportTests : LoggedTestBase
             new SocketConnectionFactoryOptions { MaxReadBufferSize = 4 }, NullLogger.Instance);
         ConnectionContext connection = factory.Create(server);
         TestOutputHelper.WriteLine($"Connection implementation: {connection.GetType().Name}");
-        Assert.Equal(IoUringMultishotConnection.IsSupported, connection is IoUringMultishotConnection);
+        Assert.Equal(System.Threading.IoUring.IsSupported, connection is IoUringPairedConnection);
         Assert.Same(server, connection.Features.Get<IConnectionSocketFeature>()!.Socket);
         CancellationToken closed = connection.ConnectionClosed;
         try

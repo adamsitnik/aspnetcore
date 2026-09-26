@@ -56,7 +56,7 @@ public sealed class SocketConnectionContextFactory : IDisposable
                     Scheduler = transportScheduler,
                     InputOptions = new PipeOptions(memoryPool, applicationScheduler, transportScheduler, maxReadBufferSize, maxReadBufferSize / 2, useSynchronizationContext: false),
                     OutputOptions = new PipeOptions(memoryPool, transportScheduler, applicationScheduler, maxWriteBufferSize, maxWriteBufferSize / 2, useSynchronizationContext: false),
-                    SocketSenderPool = IoUringMultishotConnection.IsSupported ? null : new SocketSenderPool(PipeScheduler.Inline),
+                    SocketSenderPool = System.Threading.IoUring.IsSupported ? null : new SocketSenderPool(PipeScheduler.Inline),
                     MemoryPool = memoryPool,
                 };
             }
@@ -73,7 +73,7 @@ public sealed class SocketConnectionContextFactory : IDisposable
                     Scheduler = transportScheduler,
                     InputOptions = new PipeOptions(memoryPool, applicationScheduler, transportScheduler, maxReadBufferSize, maxReadBufferSize / 2, useSynchronizationContext: false),
                     OutputOptions = new PipeOptions(memoryPool, transportScheduler, applicationScheduler, maxWriteBufferSize, maxWriteBufferSize / 2, useSynchronizationContext: false),
-                    SocketSenderPool = IoUringMultishotConnection.IsSupported ? null : new SocketSenderPool(PipeScheduler.Inline),
+                    SocketSenderPool = System.Threading.IoUring.IsSupported ? null : new SocketSenderPool(PipeScheduler.Inline),
                     MemoryPool = memoryPool,
                 }
             ];
@@ -92,17 +92,9 @@ public sealed class SocketConnectionContextFactory : IDisposable
 
         ConnectionContext connection;
 
-        if (IoUringMultishotConnection.IsSupported)
+        if (System.Threading.IoUring.IsSupported)
         {
-            IoUringMultishotConnection ioUringMultishotConnection = new(socket,
-                setting.MemoryPool,
-                _logger,
-                setting.InputOptions,
-                setting.OutputOptions,
-                finOnError: _options.FinOnError);
-
-            ioUringMultishotConnection.Start();
-            connection = ioUringMultishotConnection;
+            connection = new IoUringPairedConnection(socket, setting.MemoryPool, _logger);
         }
         else
         {
