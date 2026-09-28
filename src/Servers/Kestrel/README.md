@@ -55,10 +55,21 @@ input backpressure. Partial messages use the configured pool when its maximum bu
 permits the rent, or the shared pool for larger buffers. Connection teardown cancels and drains the receive enumerable,
 including when input is paused.
 
-For this direct-send experiment, single-segment output first attempts a native
-nonblocking `send`. `EAGAIN`/`EWOULDBLOCK` falls back to `Socket.SendAsync`;
-interrupted calls retry and partial sends preserve the remaining bytes.
-Multi-segment output keeps the existing scatter/gather `Socket.SendAsync` path.
-This experiment does not batch sends through io_uring or change receive handling.
+For this batched-send experiment, output still uses `Pipe` storage and its configured
+backpressure thresholds, but each flush publishes a send directly to the runtime's
+existing per-ring submission queue. There is no asynchronous output read loop,
+optimistic userspace send, or `Socket.SendAsync` fallback. The issuer batches requests
+across connections and performs `SEND` or gather `SENDMSG`, retrying partial sends
+without a worker callback. A pipe read is retired only after all its bytes are sent.
+Gather requests respect Linux's 1024-vector limit.
+
+Ordinary successful sends do not schedule transport work. Only backpressured writer
+continuations and connection shutdown/error handling need worker dispatch; output
+continuations never run inline on issuers. Two reusable submission identities avoid
+a race between a terminal issuer callback and a concurrent new flush, without an
+operation allocation per flush. Teardown cancels pending sends before closing the
+socket and retains their buffers until the terminal completion. Receive handling
+is unchanged. This experiment requires the companion runtime's `IoUringOperation`
+and `IoUringRequest.SendMessage` prototype APIs.
 
 For more information, see the [ASP.NET Core README](../../../README.md).

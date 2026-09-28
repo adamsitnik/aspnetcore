@@ -5,15 +5,13 @@ using System.Buffers;
 using System.Diagnostics;
 using System.IO.Pipelines;
 using System.Net.Sockets;
-using System.Runtime.InteropServices;
 using Microsoft.AspNetCore.Connections;
 using Microsoft.Extensions.Logging;
 
 namespace Microsoft.AspNetCore.Server.Kestrel.Transport.Sockets.Internal;
 
 // Receives owned multishot buffers without copying on the common, fully-consumed path.
-// Only receives are multishot; accepts and sends use ordinary socket operations.
-// Output uses an ordinary Pipe, opportunistic native sends, and Socket.SendAsync.
+// Flushes submit output to io_uring without an intermediate send-loop continuation.
 internal sealed partial class IoUringMultishotConnection : TransportConnection
 {
     private readonly Socket _socket;
@@ -21,6 +19,7 @@ internal sealed partial class IoUringMultishotConnection : TransportConnection
     private readonly IoUringMultishotPipeReader _receiveReader;
     private readonly IDuplexPipe _originalTransport;
     private readonly Pipe _sendPipe;
+    private readonly IoUringSendPipeWriter _sendWriter;
     private readonly CancellationTokenSource _connectionClosedTokenSource = new();
 
     private readonly Lock _shutdownLock = new();
@@ -56,18 +55,14 @@ internal sealed partial class IoUringMultishotConnection : TransportConnection
         ConnectionClosed = _connectionClosedTokenSource.Token;
 
         _receiveReader = new IoUringMultishotPipeReader(socket, inputOptions, OnReceiveCompleted, OnReceivePaused);
-        if (outputOptions.ReaderScheduler is IOQueue)
-        {
-            // IOQueue serializes send-loop continuations across connections sharing that queue.
-            // Scheduling directly on the ThreadPool removes that shared bottleneck and queue hop,
-            // while each connection's single send loop still preserves its write order.
-            outputOptions = new PipeOptions(outputOptions.Pool, PipeScheduler.ThreadPool, outputOptions.WriterScheduler,
-                outputOptions.PauseWriterThreshold, outputOptions.ResumeWriterThreshold,
-                outputOptions.MinimumSegmentSize, outputOptions.UseSynchronizationContext);
-        }
-        _sendPipe = new Pipe(outputOptions);
+        // AdvanceTo runs on an issuer. Only backpressured writers need a continuation,
+        // and neither an inline scheduler nor a captured context may run it on that issuer.
+        _sendPipe = new Pipe(new PipeOptions(outputOptions.Pool, PipeScheduler.ThreadPool, PipeScheduler.ThreadPool,
+            outputOptions.PauseWriterThreshold, outputOptions.ResumeWriterThreshold,
+            outputOptions.MinimumSegmentSize, useSynchronizationContext: false));
+        _sendWriter = new IoUringSendPipeWriter(socket, _sendPipe, OnSendCompleted);
 
-        Transport = _originalTransport = new DuplexPipe(_receiveReader, _sendPipe.Writer);
+        Transport = _originalTransport = new DuplexPipe(_receiveReader, _sendWriter);
 
         InitializeFeatures();
     }
@@ -80,17 +75,14 @@ internal sealed partial class IoUringMultishotConnection : TransportConnection
     {
         _receiveReader.Start();
         _closingTask = AwaitReceiveClosedAsync();
-        _sendingTask = DoSend();
+        _sendingTask = _sendWriter.Completion;
+        _sendWriter.Start();
     }
 
     public override void Abort(ConnectionAbortedException abortReason)
     {
         // Try to gracefully close the socket to match libuv/SocketConnection behavior.
         Shutdown(abortReason);
-
-        // Cancel DoSend's pending read after calling shutdown to ensure the correct
-        // _shutdownReason gets set, same as SocketConnection.
-        Output.CancelPendingRead();
 
     }
 
@@ -178,151 +170,34 @@ internal sealed partial class IoUringMultishotConnection : TransportConnection
         }
     }
 
-    // This long-running method currently performs better with AggressiveOptimization, see https://github.com/dotnet/runtime/issues/133672.
-    [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.AggressiveOptimization)]
-    private async Task DoSend()
+    private Exception? OnSendCompleted(Exception? error)
     {
-        Exception? shutdownReason = null;
+        Exception? shutdownReason = error;
         Exception? unexpectedError = null;
-        List<ArraySegment<byte>>? bufferList = null;
-
-        try
+        if (error is SocketException socketError)
         {
-            while (true)
+            if (IsConnectionResetError(socketError.SocketErrorCode))
             {
-                ReadResult result = await Output.ReadAsync();
-
-                if (result.IsCanceled)
-                {
-                    break;
-                }
-                ReadOnlySequence<byte> buffer = result.Buffer;
-
-                if (!buffer.IsEmpty)
-                {
-                    try
-                    {
-                        // Match SocketConnection's batch boundary even when io_uring completes a partial send.
-                        ReadOnlySequence<byte> remaining = buffer;
-                        while (!remaining.IsEmpty)
-                        {
-                            int bytesTransferred;
-                            if (remaining.IsSingleSegment)
-                            {
-                                if (!TrySend(_socket.SafeHandle, remaining.FirstSpan, out bytesTransferred))
-                                {
-                                    bytesTransferred = await _socket.SendAsync(remaining.First, SocketFlags.None);
-                                }
-                            }
-                            else
-                            {
-                                bufferList ??= new List<ArraySegment<byte>>();
-                                foreach (ReadOnlyMemory<byte> segment in remaining)
-                                {
-                                    bufferList.Add(segment.GetArray());
-                                }
-
-                                try
-                                {
-                                    bytesTransferred = await _socket.SendAsync(bufferList, SocketFlags.None);
-                                }
-                                finally
-                                {
-                                    bufferList.Clear();
-                                }
-                            }
-
-                            remaining = remaining.Slice(bytesTransferred);
-                        }
-                    }
-                    catch (SocketException ex)
-                    {
-                        if (IsConnectionResetError(ex.SocketErrorCode))
-                        {
-                            shutdownReason = new ConnectionResetException(ex.Message, ex);
-                            SocketsLog.ConnectionReset(_logger, this);
-
-                            break;
-                        }
-
-                        if (IsConnectionAbortError(ex.SocketErrorCode))
-                        {
-                            shutdownReason = ex;
-
-                            break;
-                        }
-
-                        unexpectedError = shutdownReason = ex;
-                    }
-                }
-
-                Output.AdvanceTo(buffer.End);
-
-                if (result.IsCompleted)
-                {
-                    break;
-                }
+                shutdownReason = new ConnectionResetException(socketError.Message, socketError);
+                SocketsLog.ConnectionReset(_logger, this);
+            }
+            else if (!IsConnectionAbortError(socketError.SocketErrorCode))
+            {
+                unexpectedError = error;
             }
         }
-        catch (ObjectDisposedException ex)
+        else if (error is not null and not ObjectDisposedException)
         {
-            // This should always be ignored since Shutdown() must have already been called by Abort().
-            shutdownReason = ex;
+            unexpectedError = error;
         }
-        catch (Exception ex)
+        if (unexpectedError is not null)
         {
-            shutdownReason = ex;
-            unexpectedError = ex;
             SocketsLog.ConnectionError(_logger, this, unexpectedError);
         }
-        finally
-        {
-            Shutdown(shutdownReason);
 
-            // Complete the output after disposing the socket
-            Output.Complete(unexpectedError);
-        }
+        Shutdown(shutdownReason);
+        return unexpectedError;
     }
-
-    internal static unsafe bool TrySend(SafeSocketHandle socket, ReadOnlySpan<byte> buffer, out int bytesTransferred)
-    {
-        Debug.Assert(OperatingSystem.IsLinux());
-        const int MsgDontWait = 0x40;
-        const int MsgNoSignal = 0x4000;
-        const int Interrupted = 4;
-        const int WouldBlock = 11;
-
-        fixed (byte* address = buffer)
-        {
-            while (true)
-            {
-                // Stay nonblocking even before receive setup, and suppress SIGPIPE on a closed peer.
-                nint result = Send(socket, address, (nuint)buffer.Length, MsgDontWait | MsgNoSignal);
-                if (result >= 0)
-                {
-                    bytesTransferred = (int)result;
-                    return true;
-                }
-
-                int error = Marshal.GetLastPInvokeError();
-                if (error == Interrupted)
-                {
-                    continue;
-                }
-                if (error == WouldBlock)
-                {
-                    bytesTransferred = 0;
-                    return false;
-                }
-
-                // The parameterless constructor translates native errno to SocketError.
-                throw new SocketException();
-            }
-        }
-    }
-
-    [LibraryImport("libc", EntryPoint = "send", SetLastError = true)]
-    private static unsafe partial nint Send(SafeSocketHandle socket, byte* buffer, nuint length, int flags);
 
     private void FireConnectionClosed()
     {
@@ -355,8 +230,9 @@ internal sealed partial class IoUringMultishotConnection : TransportConnection
 
             // Make sure to dispose the socket after the volatile _shutdownReason is set, same
             // rationale as SocketConnection.Shutdown.
-            _shutdownReason = shutdownReason ?? new ConnectionAbortedException("The io_uring transport's send loop completed gracefully.");
+            _shutdownReason = shutdownReason ?? new ConnectionAbortedException("The io_uring transport's output completed gracefully.");
 
+            _sendWriter.Abort();
             // Ask the kernel to stop the multishot recv op *before* touching the socket below -
             // the op holds a reference to the underlying file descriptor for as long as it is
             // live, so disposing/closing the socket first could block waiting for that reference

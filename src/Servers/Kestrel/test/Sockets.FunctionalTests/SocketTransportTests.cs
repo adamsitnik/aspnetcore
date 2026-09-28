@@ -611,8 +611,13 @@ public class SocketTransportTests : LoggedTestBase
     [OSSkipCondition(OperatingSystems.Windows | OperatingSystems.MacOSX)]
     [InlineData(128)]
     [InlineData(2 * 1024 * 1024)]
-    public async Task MultishotDirectSendPreservesSingleBuffer(int length)
+    public async Task MultishotBatchedSendPreservesSingleBuffer(int length)
     {
+        if (!IoUring.IsSupported)
+        {
+            return;
+        }
+
         using Socket listener = new(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
         listener.Bind(new IPEndPoint(IPAddress.Loopback, 0));
         listener.Listen(1);
@@ -628,34 +633,49 @@ public class SocketTransportTests : LoggedTestBase
             payload[index] = (byte)(index % 251);
         }
 
-        Assert.True(IoUringMultishotConnection.TrySend(server.SafeHandle, payload, out int sent));
-        if (length == 128)
+        Exception? sendError = null;
+        Pipe pipe = new(new PipeOptions(pauseWriterThreshold: length, resumeWriterThreshold: length / 2,
+            useSynchronizationContext: false));
+        IoUringSendPipeWriter writer = new(server, pipe, error => sendError = error);
+        writer.Start();
+        try
         {
-            Assert.Equal(length, sent);
-        }
-        else
-        {
-            Assert.InRange(sent, 1, length - 1);
-        }
-
-        byte[] received = new byte[sent];
-        await Task.Factory.StartNew(() =>
-        {
-            int offset = 0;
-            while (offset < received.Length)
+            payload.CopyTo(writer.GetMemory(payload.Length));
+            writer.Advance(payload.Length);
+            Task<FlushResult> flush = writer.FlushAsync().AsTask();
+            byte[] received = new byte[length];
+            await Task.Factory.StartNew(() =>
             {
-                int count = client.Receive(received.AsSpan(offset));
-                Assert.True(count > 0);
-                offset += count;
-            }
-        }, CancellationToken.None, TaskCreationOptions.LongRunning, TaskScheduler.Default).DefaultTimeout();
-        Assert.Equal(payload.AsSpan(0, sent).ToArray(), received);
+                int offset = 0;
+                while (offset < received.Length)
+                {
+                    int count = client.Receive(received.AsSpan(offset));
+                    Assert.True(count > 0);
+                    offset += count;
+                }
+            }, CancellationToken.None, TaskCreationOptions.LongRunning, TaskScheduler.Default).DefaultTimeout();
+            await flush.DefaultTimeout();
+            writer.Complete();
+            await writer.Completion.DefaultTimeout();
+            Assert.Null(sendError);
+            Assert.Equal(payload, received);
+        }
+        finally
+        {
+            writer.Abort();
+            await writer.Completion.DefaultTimeout();
+        }
     }
 
     [ConditionalFact]
     [OSSkipCondition(OperatingSystems.Windows | OperatingSystems.MacOSX)]
-    public async Task MultishotDirectSendReportsWouldBlock()
+    public async Task MultishotBatchedSendWaitsForWritableSocket()
     {
+        if (!IoUring.IsSupported)
+        {
+            return;
+        }
+
         using Socket listener = new(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
         listener.Bind(new IPEndPoint(IPAddress.Loopback, 0));
         listener.Listen(1);
@@ -665,23 +685,54 @@ public class SocketTransportTests : LoggedTestBase
         using Socket server = await listener.AcceptAsync().DefaultTimeout();
         await connecting.DefaultTimeout();
         server.SendBufferSize = 4096;
-        byte[] payload = new byte[64 * 1024];
-        int total = 0;
-        while (IoUringMultishotConnection.TrySend(server.SafeHandle, payload, out int sent))
+        byte[] payload = new byte[2 * 1024 * 1024];
+        Pipe pipe = new(new PipeOptions(pauseWriterThreshold: 1, resumeWriterThreshold: 1,
+            useSynchronizationContext: false));
+        Exception? sendError = null;
+        IoUringSendPipeWriter writer = new(server, pipe, error => sendError = error);
+        writer.Start();
+        try
         {
-            Assert.True(sent > 0);
-            total += sent;
-            Assert.True(total < 2 * 1024 * 1024);
+            Task<FlushResult> flush = writer.WriteAsync(payload).AsTask();
+            byte[] received = new byte[4096];
+            int first = await Task.Factory.StartNew(() => client.Receive(received),
+                CancellationToken.None, TaskCreationOptions.LongRunning, TaskScheduler.Default).DefaultTimeout();
+            Assert.True(first > 0);
+            Assert.False(flush.IsCompleted);
+            await Task.Factory.StartNew(() =>
+            {
+                int total = first;
+                while (total < payload.Length)
+                {
+                    int count = client.Receive(received);
+                    Assert.True(count > 0);
+                    total += count;
+                }
+                Assert.Equal(payload.Length, total);
+            }, CancellationToken.None, TaskCreationOptions.LongRunning, TaskScheduler.Default).DefaultTimeout();
+            await flush.DefaultTimeout();
+            writer.Complete();
+            await writer.Completion.DefaultTimeout();
+            Assert.Null(sendError);
         }
-        Assert.True(total > 0);
+        finally
+        {
+            writer.Abort();
+            await writer.Completion.DefaultTimeout();
+        }
     }
 
     [ConditionalTheory]
     [OSSkipCondition(OperatingSystems.Windows | OperatingSystems.MacOSX)]
     [InlineData(false)]
     [InlineData(true)]
-    public async Task MultishotDirectSendHandlesShutdownAndDisposal(bool dispose)
+    public async Task MultishotBatchedSendHandlesShutdownAndDisposal(bool dispose)
     {
+        if (!IoUring.IsSupported)
+        {
+            return;
+        }
+
         using Socket listener = new(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
         listener.Bind(new IPEndPoint(IPAddress.Loopback, 0));
         listener.Listen(1);
@@ -689,28 +740,48 @@ public class SocketTransportTests : LoggedTestBase
         Task connecting = client.ConnectAsync(listener.LocalEndPoint!);
         using Socket server = await listener.AcceptAsync().DefaultTimeout();
         await connecting.DefaultTimeout();
-        SafeSocketHandle handle = server.SafeHandle;
+        Exception? sendError = null;
+        bool completedOnWorker = false;
+        Pipe pipe = new(new PipeOptions(pauseWriterThreshold: 1, resumeWriterThreshold: 1,
+            useSynchronizationContext: false));
+        IoUringSendPipeWriter writer = new(server, pipe, error =>
+        {
+            sendError = error;
+            completedOnWorker = Thread.CurrentThread.IsThreadPoolThread;
+            return null;
+        });
         if (dispose)
         {
             server.Dispose();
-            Assert.Throws<ObjectDisposedException>(() => IoUringMultishotConnection.TrySend(handle, new byte[1], out _));
         }
         else
         {
             server.Shutdown(SocketShutdown.Send);
-            SocketException error = Assert.Throws<SocketException>(() =>
-                IoUringMultishotConnection.TrySend(handle, new byte[1], out _));
+        }
+        writer.Start();
+        await writer.WriteAsync(new byte[1]).AsTask().DefaultTimeout();
+        await writer.Completion.DefaultTimeout();
+        Assert.True(completedOnWorker);
+        if (dispose)
+        {
+            Assert.IsType<ObjectDisposedException>(sendError);
+        }
+        else
+        {
+            SocketException error = Assert.IsType<SocketException>(sendError);
             Assert.Equal(SocketError.Shutdown, error.SocketErrorCode);
             Assert.Equal(32, error.NativeErrorCode);
         }
     }
 
     [Theory]
-    [InlineData(false, false)]
-    [InlineData(false, true)]
-    [InlineData(true, false)]
-    [InlineData(true, true)]
-    public async Task MultishotConnectionSendsSingleAndMultipleBuffers(bool abort, bool multipleBuffers)
+    [InlineData(false, 128)]
+    [InlineData(false, 8192)]
+    [InlineData(false, 1025 * 4096 + 17)]
+    [InlineData(true, 128)]
+    [InlineData(true, 8192)]
+    [InlineData(true, 1025 * 4096 + 17)]
+    public async Task MultishotConnectionSendsSingleAndMultipleBuffers(bool abort, int batchLength)
     {
         if (!IoUringMultishotConnection.IsSupported)
         {
@@ -729,8 +800,7 @@ public class SocketTransportTests : LoggedTestBase
         await using ConnectionContext connection = factory.Create(server);
         for (int iteration = 0; iteration < 5; iteration++)
         {
-            bool scatterGather = multipleBuffers && iteration is 2 or 4;
-            byte[] payload = new byte[scatterGather ? 8192 : 128];
+            byte[] payload = new byte[iteration is 2 or 4 ? batchLength : 128];
             Array.Fill(payload, (byte)iteration);
             int written = 0;
             while (written < payload.Length)
@@ -742,7 +812,7 @@ public class SocketTransportTests : LoggedTestBase
                 written += length;
             }
 
-            await connection.Transport.Output.FlushAsync().AsTask().DefaultTimeout();
+            Task<FlushResult> flush = connection.Transport.Output.FlushAsync().AsTask();
             byte[] received = new byte[payload.Length];
             int count = 0;
             while (count < received.Length)
@@ -753,6 +823,7 @@ public class SocketTransportTests : LoggedTestBase
             }
 
             Assert.Equal(payload, received);
+            await flush.DefaultTimeout();
         }
 
         if (abort)
@@ -764,11 +835,121 @@ public class SocketTransportTests : LoggedTestBase
         Assert.True(server.SafeHandle.IsClosed);
     }
 
+        [Theory]
+        [InlineData(1)]
+        [InlineData(65536)]
+        public async Task MultishotBatchedSendConcurrentFlushesPreserveBytes(int threshold)
+        {
+            if (!IoUring.IsSupported)
+            {
+                return;
+            }
+
+            using Socket listener = new(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
+            listener.Bind(new IPEndPoint(IPAddress.Loopback, 0));
+            listener.Listen(1);
+            using Socket client = new(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
+            Task connecting = client.ConnectAsync(listener.LocalEndPoint!);
+            using Socket server = await listener.AcceptAsync().DefaultTimeout();
+            await connecting.DefaultTimeout();
+            server.NoDelay = true;
+            await using IoUringMultishotConnection connection = new(server, MemoryPool<byte>.Shared, NullLogger.Instance,
+                new PipeOptions(useSynchronizationContext: false),
+                new PipeOptions(writerScheduler: PipeScheduler.Inline, pauseWriterThreshold: threshold,
+                    resumeWriterThreshold: threshold, useSynchronizationContext: false));
+            connection.Start();
+            const int Count = 5000;
+            const int Length = 128;
+            Task receiving = Task.Factory.StartNew(() =>
+            {
+                byte[] bytes = new byte[Length];
+                for (int iteration = 0; iteration < Count; iteration++)
+                {
+                    int offset = 0;
+                    while (offset < bytes.Length)
+                    {
+                        int count = client.Receive(bytes.AsSpan(offset));
+                        Assert.True(count > 0);
+                        offset += count;
+                    }
+                    Assert.All(bytes, value => Assert.Equal((byte)(iteration % 251), value));
+                }
+            }, CancellationToken.None, TaskCreationOptions.LongRunning, TaskScheduler.Default);
+            try
+            {
+                PipeWriter output = connection.Transport.Output;
+                for (int iteration = 0; iteration < Count; iteration++)
+                {
+                    output.GetSpan(Length).Slice(0, Length).Fill((byte)(iteration % 251));
+                    output.Advance(Length);
+                    ValueTask<FlushResult> flush = output.FlushAsync();
+                    bool wasPending = !flush.IsCompleted;
+                    Assert.False((await flush).IsCompleted);
+                    if (wasPending)
+                    {
+                        Assert.True(Thread.CurrentThread.IsThreadPoolThread);
+                    }
+                }
+                output.Complete();
+                await receiving.DefaultTimeout();
+            }
+            finally
+            {
+                connection.Abort(new ConnectionAbortedException("Test flush cleanup"));
+                await connection.DisposeAsync().AsTask().DefaultTimeout();
+            }
+        }
+
     [Theory]
-    [InlineData(false, false)]
-    [InlineData(true, false)]
-    [InlineData(false, true)]
-    public async Task MultishotConnectionDrainsOutputBeforeAdvancing(bool abort, bool completeOutput)
+        [InlineData(false)]
+        [InlineData(true)]
+        public async Task MultishotBatchedSendPreCanceledWriteDoesNotPublishBytes(bool writeAfterCancellation)
+        {
+            if (!IoUring.IsSupported)
+            {
+                return;
+            }
+
+            using Socket listener = new(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
+            listener.Bind(new IPEndPoint(IPAddress.Loopback, 0));
+            listener.Listen(1);
+            using Socket client = new(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
+            Task connecting = client.ConnectAsync(listener.LocalEndPoint!);
+            using Socket server = await listener.AcceptAsync().DefaultTimeout();
+            await connecting.DefaultTimeout();
+            using SocketConnectionContextFactory factory = new(new SocketConnectionFactoryOptions(), NullLogger.Instance);
+            await using ConnectionContext connection = factory.Create(server);
+            PipeWriter output = connection.Transport.Output;
+            await Assert.ThrowsAnyAsync<OperationCanceledException>(() =>
+                output.WriteAsync(new byte[] { 1, 2, 3 }, new CancellationToken(canceled: true)).AsTask());
+            if (writeAfterCancellation)
+            {
+                await output.WriteAsync(new byte[] { 42 }).AsTask().DefaultTimeout();
+            }
+            output.Complete();
+
+            byte[] received = await Task.Factory.StartNew(() =>
+            {
+                using MemoryStream stream = new();
+                byte[] buffer = new byte[16];
+                int count;
+                while ((count = client.Receive(buffer)) != 0)
+                {
+                    stream.Write(buffer, 0, count);
+                }
+                return stream.ToArray();
+            }, CancellationToken.None, TaskCreationOptions.LongRunning, TaskScheduler.Default).DefaultTimeout();
+            Assert.Equal(writeAfterCancellation ? new byte[] { 42 } : Array.Empty<byte>(), received);
+        }
+
+        [Theory]
+        [InlineData(false, false, false)]
+        [InlineData(true, false, false)]
+        [InlineData(false, true, false)]
+        [InlineData(false, false, true)]
+        [InlineData(true, false, true)]
+        [InlineData(false, true, true)]
+        public async Task MultishotConnectionDrainsOutputBeforeAdvancing(bool abort, bool completeOutput, bool multipleBuffers)
     {
         if (!IoUringMultishotConnection.IsSupported)
         {
@@ -797,8 +978,15 @@ public class SocketTransportTests : LoggedTestBase
         }
 
         PipeWriter output = connection.Transport.Output;
-        payload.CopyTo(output.GetMemory(payload.Length));
-        output.Advance(payload.Length);
+        int written = 0;
+        while (written < payload.Length)
+        {
+            Memory<byte> memory = output.GetMemory(multipleBuffers ? 1 : payload.Length);
+            int length = Math.Min(memory.Length, payload.Length - written);
+            payload.AsMemory(written, length).CopyTo(memory);
+            output.Advance(length);
+            written += length;
+        }
         Task<FlushResult> flush = output.FlushAsync().AsTask();
         if (completeOutput)
         {
@@ -818,6 +1006,8 @@ public class SocketTransportTests : LoggedTestBase
             Pipe pipe = Assert.IsType<Pipe>(pipeField.GetValue(connection));
             PropertyInfo lengthProperty = typeof(Pipe).GetProperty("Length", BindingFlags.Instance | BindingFlags.NonPublic)!;
             Assert.Equal((long)payload.Length, Assert.IsType<long>(lengthProperty.GetValue(pipe)));
+            Assert.Equal(multipleBuffers, pool.Rented > 1);
+            Assert.All(pool.Owners, owner => Assert.False(owner.Disposed));
             if (!completeOutput)
             {
                 Assert.False(flush.IsCompleted);
@@ -842,6 +1032,7 @@ public class SocketTransportTests : LoggedTestBase
             client.Dispose();
             await connection.DisposeAsync().AsTask().DefaultTimeout();
         }
+        Assert.All(pool.Owners, owner => Assert.True(owner.Disposed));
 
         void Receive(int offset, int end)
         {
@@ -1510,14 +1701,16 @@ public class SocketTransportTests : LoggedTestBase
 
     private sealed class CountingPool(int maxBufferSize = int.MaxValue) : MemoryPool<byte>
     {
-        public int Rented { get; private set; }
+        public List<TestOwner> Owners { get; } = new();
+        public int Rented => Owners.Count;
         public override int MaxBufferSize => maxBufferSize;
 
         public override IMemoryOwner<byte> Rent(int minBufferSize = -1)
         {
             ArgumentOutOfRangeException.ThrowIfGreaterThan(minBufferSize, MaxBufferSize);
-            Rented++;
-            return new TestOwner(new byte[Math.Max(1, minBufferSize)]);
+            TestOwner owner = new(new byte[Math.Max(1, minBufferSize)]);
+            Owners.Add(owner);
+            return owner;
         }
 
         protected override void Dispose(bool disposing)
