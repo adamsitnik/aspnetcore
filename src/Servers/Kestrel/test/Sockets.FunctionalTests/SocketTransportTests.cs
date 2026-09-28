@@ -186,6 +186,139 @@ public class SocketTransportTests : LoggedTestBase
         }
     }
 
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task MultishotReaderResumedDrainObservesCompletionBeforeCancellation(bool abort)
+    {
+        Action<IMemoryOwner<byte>>? publish = null;
+        async Task Receive(Action<IMemoryOwner<byte>> callback, CancellationToken cancellationToken)
+        {
+            publish = callback;
+            await Task.Delay(Timeout.Infinite, cancellationToken);
+        }
+
+        QueuedPipeScheduler scheduler = new();
+        IoUringMultishotPipeReader reader = new(Receive,
+            new PipeOptions(readerScheduler: PipeScheduler.Inline, writerScheduler: scheduler,
+                pauseWriterThreshold: 4, resumeWriterThreshold: 2, useSynchronizationContext: false));
+        reader.Start();
+        TestOwner first = new([1, 2, 3, 4]);
+        TestOwner second = new([5, 6]);
+        try
+        {
+            publish!(first);
+            publish(second);
+            ReadResult result = await reader.ReadAsync();
+            reader.AdvanceTo(result.Buffer.End);
+            (Action<object?> action, object? state) = await scheduler.Scheduled.Task.DefaultTimeout();
+            ValueTaskAwaiter<ReadResult> pending = reader.ReadAsync().GetAwaiter();
+            bool drained = false;
+            IOException failure = new("Aborted");
+            pending.UnsafeOnCompleted(() =>
+            {
+                if (abort)
+                {
+                    Assert.Same(failure, Assert.Throws<IOException>(() => pending.GetResult()));
+                }
+                else
+                {
+                    Assert.Throws<InvalidOperationException>(() => pending.GetResult());
+                }
+                action(state);
+                drained = true;
+            });
+            if (abort)
+            {
+                reader.Abort(failure);
+            }
+            else
+            {
+                reader.Complete();
+            }
+            Assert.True(drained);
+            Assert.True(second.Disposed);
+        }
+        finally
+        {
+            await reader.CompleteAsync().AsTask().DefaultTimeout();
+        }
+        Assert.True(first.Disposed);
+    }
+
+    [Fact]
+    public async Task MultishotReaderCallbackPublishesSynchronously()
+    {
+        Action<IMemoryOwner<byte>>? publish = null;
+        async Task Receive(Action<IMemoryOwner<byte>> callback, CancellationToken cancellationToken)
+        {
+            publish = callback;
+            await Task.Delay(Timeout.Infinite, cancellationToken);
+        }
+
+        IoUringMultishotPipeReader reader = new(Receive, PipeOptions.Default);
+        reader.Start();
+        try
+        {
+            TestOwner owner = new([42]);
+            ValueTask<ReadResult> pending = reader.ReadAsync();
+            publish!(owner);
+            Assert.True(pending.IsCompletedSuccessfully);
+            ReadResult result = await pending;
+            Assert.True(result.Buffer.First.Equals(owner.Memory));
+            reader.AdvanceTo(result.Buffer.End);
+            Assert.True(owner.Disposed);
+        }
+        finally
+        {
+            await reader.CompleteAsync().AsTask().DefaultTimeout();
+        }
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task MultishotReaderPausedCallbacksDrainOnEofOrCancellation(bool cancel)
+    {
+        Action<IMemoryOwner<byte>>? publish = null;
+        TaskCompletionSource finished = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        async Task Receive(Action<IMemoryOwner<byte>> callback, CancellationToken cancellationToken)
+        {
+            publish = callback;
+            await finished.Task.WaitAsync(cancellationToken);
+        }
+
+        IoUringMultishotPipeReader reader = new(Receive,
+            new PipeOptions(pauseWriterThreshold: 4, resumeWriterThreshold: 2));
+        reader.Start();
+        TestOwner first = new([1, 2, 3, 4]);
+        TestOwner second = new([5, 6]);
+        try
+        {
+            publish!(first);
+            publish(second);
+            finished.SetResult();
+            Assert.False(reader.Closed.IsCompleted);
+            ReadResult result = await reader.ReadAsync().AsTask().DefaultTimeout();
+            Assert.Equal(new byte[] { 1, 2, 3, 4 }, result.Buffer.ToArray());
+            Assert.False(second.Disposed);
+            if (!cancel)
+            {
+                reader.AdvanceTo(result.Buffer.End);
+                result = await reader.ReadAsync().AsTask().DefaultTimeout();
+                Assert.Equal(new byte[] { 5, 6 }, result.Buffer.ToArray());
+                reader.AdvanceTo(result.Buffer.End);
+                await reader.Closed.DefaultTimeout();
+            }
+        }
+        finally
+        {
+            await reader.CompleteAsync().AsTask().DefaultTimeout();
+        }
+        Assert.True(first.Disposed);
+        Assert.True(second.Disposed);
+    }
+
     [Fact]
     public async Task MultishotReaderPreservesOrderAndPartialConsumption()
     {
@@ -230,7 +363,7 @@ public class SocketTransportTests : LoggedTestBase
         const int BufferSize = 4096;
         TestOwner? previous = null;
         int returned = 0;
-        async IAsyncEnumerable<IMemoryOwner<byte>> Receive([EnumeratorCancellation] CancellationToken cancellationToken)
+        async Task Receive(Action<IMemoryOwner<byte>> onReceived, CancellationToken cancellationToken)
         {
             for (int index = 0; index < BufferCount; index++)
             {
@@ -243,9 +376,8 @@ public class SocketTransportTests : LoggedTestBase
                 byte[] bytes = new byte[BufferSize];
                 Array.Fill(bytes, (byte)(index % 251));
                 previous = new TestOwner(bytes);
-                yield return previous;
-                await Task.Yield();
-                cancellationToken.ThrowIfCancellationRequested();
+                onReceived(previous);
+                await previous.Returned.Task.WaitAsync(cancellationToken);
             }
         }
 
@@ -415,10 +547,12 @@ public class SocketTransportTests : LoggedTestBase
             source.Write(new TestOwner([1, 2, 3, 4]));
             source.Write(new TestOwner([5]));
             await paused.Task.DefaultTimeout();
+            await source.Delivered.WaitAsync().DefaultTimeout();
+            await source.Delivered.WaitAsync().DefaultTimeout();
             ReadResult result = await reader.ReadAsync().AsTask().DefaultTimeout();
             Assert.Equal(4, result.Buffer.Length);
             reader.AdvanceTo(result.Buffer.Start, result.Buffer.Start);
-            Assert.Equal(1, source.Yielded);
+            Assert.Equal(2, source.Yielded);
 
             result = await reader.ReadAsync().AsTask().DefaultTimeout();
             reader.AdvanceTo(result.Buffer.Start, result.Buffer.End);
@@ -436,13 +570,13 @@ public class SocketTransportTests : LoggedTestBase
     public async Task MultishotReaderStartFailureAndCompleteBeforeStartDoNotHang()
     {
         IOException failure = new IOException("Start failed");
-        IoUringMultishotPipeReader reader = new(_ => throw failure, PipeOptions.Default);
+        IoUringMultishotPipeReader reader = new((_, _) => throw failure, PipeOptions.Default);
         Task<ReadResult> pending = reader.ReadAsync().AsTask();
         reader.Start();
         Assert.Same(failure, await Assert.ThrowsAsync<IOException>(() => pending.DefaultTimeout()));
         await reader.CompleteAsync().AsTask().DefaultTimeout();
 
-        reader = new IoUringMultishotPipeReader(_ => throw failure, PipeOptions.Default);
+        reader = new IoUringMultishotPipeReader((_, _) => throw failure, PipeOptions.Default);
         reader.Complete();
         reader.Start();
         await reader.Closed.DefaultTimeout();
@@ -1508,6 +1642,15 @@ public class SocketTransportTests : LoggedTestBase
         }
     }
 
+    private sealed class QueuedPipeScheduler : PipeScheduler
+    {
+        public TaskCompletionSource<(Action<object?>, object?)> Scheduled { get; } =
+            new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        public override void Schedule(Action<object?> action, object? state) =>
+            Scheduled.SetResult((action, state));
+    }
+
     private sealed class CountingPool(int maxBufferSize = int.MaxValue) : MemoryPool<byte>
     {
         public int Rented { get; private set; }
@@ -1529,12 +1672,14 @@ public class SocketTransportTests : LoggedTestBase
     {
         public Memory<byte> Memory => bytes;
         public bool Disposed { get; private set; }
+        public TaskCompletionSource Returned { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
 
         public void Dispose()
         {
             Assert.False(Disposed);
             Disposed = true;
             Array.Fill(bytes, (byte)0xff);
+            Returned.TrySetResult();
         }
     }
 
@@ -1542,19 +1687,21 @@ public class SocketTransportTests : LoggedTestBase
     {
         private readonly Channel<IMemoryOwner<byte>> _channel = Channel.CreateUnbounded<IMemoryOwner<byte>>();
         public TaskCompletionSource Stopped { get; } = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        public SemaphoreSlim Delivered { get; } = new(0);
         public int Yielded { get; private set; }
 
         public void Write(IMemoryOwner<byte> owner) => Assert.True(_channel.Writer.TryWrite(owner));
         public void Complete(Exception? error = null) => _channel.Writer.TryComplete(error);
 
-        public async IAsyncEnumerable<IMemoryOwner<byte>> ReadAsync([EnumeratorCancellation] CancellationToken cancellationToken)
+        public async Task ReadAsync(Action<IMemoryOwner<byte>> onReceived, CancellationToken cancellationToken)
         {
             try
             {
                 await foreach (IMemoryOwner<byte> owner in _channel.Reader.ReadAllAsync(cancellationToken))
                 {
                     Yielded++;
-                    yield return owner;
+                    onReceived(owner);
+                    Delivered.Release();
                 }
             }
             finally

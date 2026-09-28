@@ -16,7 +16,7 @@ internal sealed class IoUringMultishotPipeReader : PipeReader, IValueTaskSource<
     // Protects the shared buffer chain, backpressure, and completion/cancellation handoff.
     // Application continuations must run outside this lock.
     private readonly Lock _lock = new();
-    private readonly Func<CancellationToken, IAsyncEnumerable<IMemoryOwner<byte>>> _receive;
+    private readonly Func<Action<IMemoryOwner<byte>>, CancellationToken, Task> _receive;
     private readonly PipeOptions _options;
     private readonly Func<Exception?, Exception?>? _onCompleted;
     private readonly Action<bool>? _onPause;
@@ -38,6 +38,8 @@ internal sealed class IoUringMultishotPipeReader : PipeReader, IValueTaskSource<
     private ReadOnlySequence<byte> _readBuffer;
     private ReadState _readState;
     private TaskCompletionSource? _resume;
+    private TaskCompletionSource? _pauseCompletion;
+    private Queue<IMemoryOwner<byte>>? _pendingBuffers;
     private Exception? _error;
     private bool _started;
     private bool _readerCompleted;
@@ -60,7 +62,7 @@ internal sealed class IoUringMultishotPipeReader : PipeReader, IValueTaskSource<
     {
     }
 
-    internal IoUringMultishotPipeReader(Func<CancellationToken, IAsyncEnumerable<IMemoryOwner<byte>>> receive,
+    internal IoUringMultishotPipeReader(Func<Action<IMemoryOwner<byte>>, CancellationToken, Task> receive,
         PipeOptions options, Func<Exception?, Exception?>? onCompleted = null, Action<bool>? onPause = null)
     {
         _receive = receive;
@@ -86,85 +88,12 @@ internal sealed class IoUringMultishotPipeReader : PipeReader, IValueTaskSource<
         _ = ReceiveAsync();
     }
 
-    // The receive loop runs for the connection's lifetime; request optimized code up front
-    // rather than relying on tiered promotion during steady-state request processing.
-    [MethodImpl(MethodImplOptions.AggressiveOptimization)]
     private async Task ReceiveAsync()
     {
         Exception? error = null;
         try
         {
-            await foreach (IMemoryOwner<byte> owner in _receive(_stop.Token).ConfigureAwait(false))
-            {
-                Task? resume;
-                ReadCompletion completion;
-                lock (_lock)
-                {
-                    if (_readerCompleted || _writerCompleted)
-                    {
-                        owner.Dispose();
-                        break;
-                    }
-
-                    IoUringMultishotBufferSegment segment;
-                    try
-                    {
-                        if (_cachedSegments is null)
-                        {
-                            segment = new IoUringMultishotBufferSegment(owner, _written);
-                        }
-                        else
-                        {
-                            segment = _cachedSegments;
-                            _cachedSegments = (IoUringMultishotBufferSegment?)segment.Next;
-                            _cachedSegmentCount--;
-                            segment.Initialize(owner, _written);
-                        }
-                    }
-                    catch
-                    {
-                        owner.Dispose();
-                        throw;
-                    }
-
-                    if (segment.Memory.IsEmpty)
-                    {
-                        owner.Dispose();
-                        continue;
-                    }
-
-                    _written += segment.Memory.Length;
-                    if (_tail is null)
-                    {
-                        _head = segment;
-                    }
-                    else
-                    {
-                        _tail.SetNext(segment);
-                    }
-
-                    _tail = segment;
-                    completion = CompletePendingRead();
-
-                    if (_options.PauseWriterThreshold > 0 && _written - _examined >= _options.PauseWriterThreshold)
-                    {
-                        _resume ??= new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
-                    }
-
-                    resume = _resume?.Task;
-                }
-
-                completion.Publish(this);
-                if (resume is not null)
-                {
-                    _onPause?.Invoke(true);
-                    // Cancel the enumeration's token as well as this wait on shutdown: the
-                    // native receive can still be active while its consumer is paused here.
-                    await resume.WaitAsync(_stop.Token).ConfigureAwait(false);
-                    await new SchedulerAwaitable(_options.WriterScheduler);
-                    _onPause?.Invoke(false);
-                }
-            }
+            await _receive(OnReceived, _stop.Token).ConfigureAwait(false);
         }
         catch (OperationCanceledException) when (_stop.IsCancellationRequested)
         {
@@ -175,6 +104,20 @@ internal sealed class IoUringMultishotPipeReader : PipeReader, IValueTaskSource<
         }
         finally
         {
+            Task? paused;
+            lock (_lock)
+            {
+                paused = _pauseCompletion?.Task;
+            }
+            if (paused is not null)
+            {
+                await paused.ConfigureAwait(false);
+            }
+
+            lock (_lock)
+            {
+                error ??= _error;
+            }
             try
             {
                 error = _onCompleted is null ? error : _onCompleted(error);
@@ -193,8 +136,169 @@ internal sealed class IoUringMultishotPipeReader : PipeReader, IValueTaskSource<
             }
 
             completion.Publish(this);
-            // await foreach has disposed and drained the native enumerator before this point.
+            // Both native callbacks and paused buffer publication have drained.
             _closed.TrySetResult();
+        }
+    }
+
+    private void OnReceived(IMemoryOwner<byte> owner)
+    {
+        ReadCompletion completion;
+        Task? resume;
+        TaskCompletionSource? paused = null;
+        lock (_lock)
+        {
+            if (_readerCompleted || _writerCompleted)
+            {
+                owner.Dispose();
+                return;
+            }
+
+            if (_pauseCompletion is not null)
+            {
+                // Native receives continue while publication is paused. Leases remain bounded
+                // by the provided-buffer pool, just as in the former Channel adapter.
+                (_pendingBuffers ??= new Queue<IMemoryOwner<byte>>()).Enqueue(owner);
+                return;
+            }
+
+            completion = AppendBuffer(owner);
+            resume = _resume?.Task;
+            if (resume is not null)
+            {
+                _pauseCompletion = paused = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+            }
+        }
+
+        try
+        {
+            completion.Publish(this);
+        }
+        finally
+        {
+            if (resume is not null)
+            {
+                _ = ResumeReceivingAsync(resume, paused!);
+            }
+        }
+    }
+
+    private ReadCompletion AppendBuffer(IMemoryOwner<byte> owner)
+    {
+        IoUringMultishotBufferSegment segment;
+        try
+        {
+            if (owner.Memory.IsEmpty)
+            {
+                owner.Dispose();
+                return default;
+            }
+
+            if (_cachedSegments is null)
+            {
+                segment = new IoUringMultishotBufferSegment(owner, _written);
+            }
+            else
+            {
+                segment = _cachedSegments;
+                _cachedSegments = (IoUringMultishotBufferSegment?)segment.Next;
+                _cachedSegmentCount--;
+                segment.Initialize(owner, _written);
+            }
+        }
+        catch
+        {
+            owner.Dispose();
+            throw;
+        }
+
+        _written += segment.Memory.Length;
+        if (_tail is null)
+        {
+            _head = segment;
+        }
+        else
+        {
+            _tail.SetNext(segment);
+        }
+
+        _tail = segment;
+        ReadCompletion completion = CompletePendingRead();
+        if (_options.PauseWriterThreshold > 0 && _written - _examined >= _options.PauseWriterThreshold)
+        {
+            _resume ??= new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        }
+
+        return completion;
+    }
+
+    private async Task ResumeReceivingAsync(Task resume, TaskCompletionSource paused)
+    {
+        try
+        {
+            while (true)
+            {
+                _onPause?.Invoke(true);
+                await resume.WaitAsync(_stop.Token).ConfigureAwait(false);
+                await new SchedulerAwaitable(_options.WriterScheduler);
+                _onPause?.Invoke(false);
+
+                while (true)
+                {
+                    ReadCompletion completion;
+                    Task? nextResume;
+                    lock (_lock)
+                    {
+                        if (_readerCompleted || _writerCompleted)
+                        {
+                            return;
+                        }
+
+                        _stop.Token.ThrowIfCancellationRequested();
+                        if (_pendingBuffers is null || !_pendingBuffers.TryDequeue(out IMemoryOwner<byte>? owner))
+                        {
+                            _pauseCompletion = null;
+                            return;
+                        }
+
+                        completion = AppendBuffer(owner);
+                        nextResume = _resume?.Task;
+                    }
+
+                    completion.Publish(this);
+                    if (nextResume is not null)
+                    {
+                        resume = nextResume;
+                        break;
+                    }
+                }
+            }
+        }
+        catch (OperationCanceledException) when (_stop.IsCancellationRequested)
+        {
+        }
+        catch (Exception error)
+        {
+            lock (_lock)
+            {
+                _error ??= error;
+            }
+            _stop.Cancel();
+        }
+        finally
+        {
+            lock (_lock)
+            {
+                if (_pauseCompletion == paused)
+                {
+                    while (_pendingBuffers is not null && _pendingBuffers.TryDequeue(out IMemoryOwner<byte>? owner))
+                    {
+                        owner.Dispose();
+                    }
+                    _pauseCompletion = null;
+                }
+            }
+            paused.TrySetResult();
         }
     }
 

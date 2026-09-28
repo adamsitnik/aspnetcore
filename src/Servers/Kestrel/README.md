@@ -40,8 +40,11 @@ You can also run project specific tests by running `dotnet test` in the `tests` 
 
 ### Experimental io_uring socket transport
 
-This branch's socket transport requires the companion runtime's
-`Socket.ReceiveMultishotAsync` API. Connections use ordinary `Socket.AcceptAsync`.
+This branch's socket transport requires the companion runtime's callback overload
+of `Socket.ReceiveMultishotAsync`. Receive-completion workers publish buffers directly
+to the input reader without a Channel or async iterator. A queue is allocated only
+when input backpressure pauses publication; cancellation drains both native callbacks
+and queued leases before closing the reader. Connections use ordinary `Socket.AcceptAsync`.
 `DOTNET_USE_IO_URING=1` is the only enable switch; the transport selects the
 ordinary socket implementation when `System.Threading.IoUring.IsSupported` is false.
 The runtime waits for returned buffers and rearms multishot receive after pool exhaustion;
