@@ -55,4 +55,10 @@ input backpressure. Partial messages use the configured pool when its maximum bu
 permits the rent, or the shared pool for larger buffers. Connection teardown cancels and drains the receive enumerable,
 including when input is paused.
 
+For this direct-send experiment, single-segment output first attempts a native
+nonblocking `send`. `EAGAIN`/`EWOULDBLOCK` falls back to `Socket.SendAsync`;
+interrupted calls retry and partial sends preserve the remaining bytes.
+Multi-segment output keeps the existing scatter/gather `Socket.SendAsync` path.
+This experiment does not batch sends through io_uring or change receive handling.
+
 For more information, see the [ASP.NET Core README](../../../README.md).

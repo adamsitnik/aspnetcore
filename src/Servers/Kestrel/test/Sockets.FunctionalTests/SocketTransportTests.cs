@@ -607,6 +607,104 @@ public class SocketTransportTests : LoggedTestBase
         }
     }
 
+    [ConditionalTheory]
+    [OSSkipCondition(OperatingSystems.Windows | OperatingSystems.MacOSX)]
+    [InlineData(128)]
+    [InlineData(2 * 1024 * 1024)]
+    public async Task MultishotDirectSendPreservesSingleBuffer(int length)
+    {
+        using Socket listener = new(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
+        listener.Bind(new IPEndPoint(IPAddress.Loopback, 0));
+        listener.Listen(1);
+        using Socket client = new(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
+        client.ReceiveBufferSize = 4096;
+        Task connecting = client.ConnectAsync(listener.LocalEndPoint!);
+        using Socket server = await listener.AcceptAsync().DefaultTimeout();
+        await connecting.DefaultTimeout();
+        server.SendBufferSize = 4096;
+        byte[] payload = new byte[length];
+        for (int index = 0; index < payload.Length; index++)
+        {
+            payload[index] = (byte)(index % 251);
+        }
+
+        Assert.True(IoUringMultishotConnection.TrySend(server.SafeHandle, payload, out int sent));
+        if (length == 128)
+        {
+            Assert.Equal(length, sent);
+        }
+        else
+        {
+            Assert.InRange(sent, 1, length - 1);
+        }
+
+        byte[] received = new byte[sent];
+        await Task.Factory.StartNew(() =>
+        {
+            int offset = 0;
+            while (offset < received.Length)
+            {
+                int count = client.Receive(received.AsSpan(offset));
+                Assert.True(count > 0);
+                offset += count;
+            }
+        }, CancellationToken.None, TaskCreationOptions.LongRunning, TaskScheduler.Default).DefaultTimeout();
+        Assert.Equal(payload.AsSpan(0, sent).ToArray(), received);
+    }
+
+    [ConditionalFact]
+    [OSSkipCondition(OperatingSystems.Windows | OperatingSystems.MacOSX)]
+    public async Task MultishotDirectSendReportsWouldBlock()
+    {
+        using Socket listener = new(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
+        listener.Bind(new IPEndPoint(IPAddress.Loopback, 0));
+        listener.Listen(1);
+        using Socket client = new(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
+        client.ReceiveBufferSize = 4096;
+        Task connecting = client.ConnectAsync(listener.LocalEndPoint!);
+        using Socket server = await listener.AcceptAsync().DefaultTimeout();
+        await connecting.DefaultTimeout();
+        server.SendBufferSize = 4096;
+        byte[] payload = new byte[64 * 1024];
+        int total = 0;
+        while (IoUringMultishotConnection.TrySend(server.SafeHandle, payload, out int sent))
+        {
+            Assert.True(sent > 0);
+            total += sent;
+            Assert.True(total < 2 * 1024 * 1024);
+        }
+        Assert.True(total > 0);
+    }
+
+    [ConditionalTheory]
+    [OSSkipCondition(OperatingSystems.Windows | OperatingSystems.MacOSX)]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task MultishotDirectSendHandlesShutdownAndDisposal(bool dispose)
+    {
+        using Socket listener = new(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
+        listener.Bind(new IPEndPoint(IPAddress.Loopback, 0));
+        listener.Listen(1);
+        using Socket client = new(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
+        Task connecting = client.ConnectAsync(listener.LocalEndPoint!);
+        using Socket server = await listener.AcceptAsync().DefaultTimeout();
+        await connecting.DefaultTimeout();
+        SafeSocketHandle handle = server.SafeHandle;
+        if (dispose)
+        {
+            server.Dispose();
+            Assert.Throws<ObjectDisposedException>(() => IoUringMultishotConnection.TrySend(handle, new byte[1], out _));
+        }
+        else
+        {
+            server.Shutdown(SocketShutdown.Send);
+            SocketException error = Assert.Throws<SocketException>(() =>
+                IoUringMultishotConnection.TrySend(handle, new byte[1], out _));
+            Assert.Equal(SocketError.Shutdown, error.SocketErrorCode);
+            Assert.Equal(32, error.NativeErrorCode);
+        }
+    }
+
     [Theory]
     [InlineData(false, false)]
     [InlineData(false, true)]

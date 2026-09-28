@@ -5,6 +5,7 @@ using System.Buffers;
 using System.Diagnostics;
 using System.IO.Pipelines;
 using System.Net.Sockets;
+using System.Runtime.InteropServices;
 using Microsoft.AspNetCore.Connections;
 using Microsoft.Extensions.Logging;
 
@@ -12,7 +13,7 @@ namespace Microsoft.AspNetCore.Server.Kestrel.Transport.Sockets.Internal;
 
 // Receives owned multishot buffers without copying on the common, fully-consumed path.
 // Only receives are multishot; accepts and sends use ordinary socket operations.
-// Output uses an ordinary Pipe and Socket.SendAsync.
+// Output uses an ordinary Pipe, opportunistic native sends, and Socket.SendAsync.
 internal sealed partial class IoUringMultishotConnection : TransportConnection
 {
     private readonly Socket _socket;
@@ -208,7 +209,10 @@ internal sealed partial class IoUringMultishotConnection : TransportConnection
                             int bytesTransferred;
                             if (remaining.IsSingleSegment)
                             {
-                                bytesTransferred = await _socket.SendAsync(remaining.First, SocketFlags.None);
+                                if (!TrySend(_socket.SafeHandle, remaining.FirstSpan, out bytesTransferred))
+                                {
+                                    bytesTransferred = await _socket.SendAsync(remaining.First, SocketFlags.None);
+                                }
                             }
                             else
                             {
@@ -279,6 +283,46 @@ internal sealed partial class IoUringMultishotConnection : TransportConnection
             Output.Complete(unexpectedError);
         }
     }
+
+    internal static unsafe bool TrySend(SafeSocketHandle socket, ReadOnlySpan<byte> buffer, out int bytesTransferred)
+    {
+        Debug.Assert(OperatingSystem.IsLinux());
+        const int MsgDontWait = 0x40;
+        const int MsgNoSignal = 0x4000;
+        const int Interrupted = 4;
+        const int WouldBlock = 11;
+
+        fixed (byte* address = buffer)
+        {
+            while (true)
+            {
+                // Stay nonblocking even before receive setup, and suppress SIGPIPE on a closed peer.
+                nint result = Send(socket, address, (nuint)buffer.Length, MsgDontWait | MsgNoSignal);
+                if (result >= 0)
+                {
+                    bytesTransferred = (int)result;
+                    return true;
+                }
+
+                int error = Marshal.GetLastPInvokeError();
+                if (error == Interrupted)
+                {
+                    continue;
+                }
+                if (error == WouldBlock)
+                {
+                    bytesTransferred = 0;
+                    return false;
+                }
+
+                // The parameterless constructor translates native errno to SocketError.
+                throw new SocketException();
+            }
+        }
+    }
+
+    [LibraryImport("libc", EntryPoint = "send", SetLastError = true)]
+    private static unsafe partial nint Send(SafeSocketHandle socket, byte* buffer, nuint length, int flags);
 
     private void FireConnectionClosed()
     {
